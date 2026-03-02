@@ -1,16 +1,16 @@
 import os
-# 1. FIX OPENMP RUNTIME ERROR: Prevents the "Error #15" initialization crash 
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 import numpy as np
 import matplotlib.pyplot as plt
 import pandas as pd
-
 import torch
+
+# Fix for OpenMP runtime conflict
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 class Logger:
     """
-    Handles real-time tracking of rewards and constraint violations during 
-    the 50,000 episode training run.
+    Handles real-time tracking of rewards and constraint violations 
+    during the 50,000 episode training run[cite: 16].
     """
     def __init__(self, experiment_name):
         self.name = experiment_name
@@ -20,101 +20,119 @@ class Logger:
         self.violation_rates = []
         
     def log_episode(self, reward, violated):
-        """Logs the total reward and safety status of a completed episode."""
+        """Logs the total reward and safety status of a completed episode[cite: 19]."""
         self.rewards.append(reward)
         self.violations.append(1 if violated else 0)
         
-        # Calculate 100-episode moving averages for smoother training curves
+        # Calculate 100-episode moving averages for smooth visualization [cite: 20]
         window = 100
         if len(self.rewards) >= window:
             self.avg_rewards.append(np.mean(self.rewards[-window:]))
             self.violation_rates.append(np.mean(self.violations[-window:]) * 100)
         else:
-            # Fallback for the first 99 episodes
             self.avg_rewards.append(np.mean(self.rewards))
             self.violation_rates.append(np.mean(self.violations) * 100)
 
-    def print_status(self, episode, total):
-        """Prints current performance metrics to the console."""
-        print(f"[{self.name}] Ep {episode}/{total} | "
-              f"Avg Rew: {self.avg_rewards[-1]:.2f} | "
-              f"Viol Rate: {self.violation_rates[-1]:.2f}%")
-
-    def save_logs(self):
-        """Exports the training history to a CSV for external analysis."""
+    def save_data(self):
+        """Saves training logs to CSV for later analysis[cite: 19]."""
         df = pd.DataFrame({
             'reward': self.rewards,
+            'violation': self.violations,
             'avg_reward': self.avg_rewards,
             'violation_rate': self.violation_rates
         })
         df.to_csv(f"{self.name}_logs.csv", index=False)
 
-def plot_training_results(baseline_logger, resnet_logger):
+def plot_training_results(loggers):
     """
-    Generates high-resolution comparison plots between the Baseline PPO 
-    and the ResNet-Guided PPO.
+    Generates Learning Curves (Requirement 1): 
+    Cumulative reward and violation rates vs. episode[cite: 20].
     """
-    plt.style.use('seaborn-v0_8-muted')
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 12))
-
-    # --- Plot 1: Reward Convergence ---
-    ax1.plot(baseline_logger.avg_rewards, label='Baseline (Lagrangian Penalty)', color='tab:red', alpha=0.8)
-    ax1.plot(resnet_logger.avg_rewards, label='Proposed (ResNet Projection)', color='tab:blue', linewidth=2)
-    ax1.set_title("Training Convergence: Cumulative Reward")
-    ax1.set_xlabel("Episode")
-    ax1.set_ylabel("100-Ep Moving Average Reward")
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10), sharex=True)
+    
+    for logger in loggers:
+        ax1.plot(logger.avg_rewards, label=f"{logger.name} Reward")
+        ax2.plot(logger.violation_rates, label=f"{logger.name} Violation Rate (%)")
+    
+    ax1.set_ylabel("Average Reward (100-ep window)")
+    ax1.set_title("Learning Curves: Convergence & Safety")
     ax1.legend()
     ax1.grid(True, alpha=0.3)
-
-    # --- Plot 2: Violation Rates ---
-    ax2.plot(baseline_logger.violation_rates, label='Baseline Violations', color='tab:red', linestyle='--')
-    ax2.plot(resnet_logger.violation_rates, label='ResNet Violations', color='tab:blue', linewidth=2)
-    ax2.set_title("Safety Performance: Constraint Violation Rate")
+    
+    ax2.set_ylabel("Violation Rate (%)")
     ax2.set_xlabel("Episode")
-    ax2.set_ylabel("Violation Frequency (%)")
-    ax2.set_ylim(-5, 105) # Keeps the y-axis standard for percentage comparison
     ax2.legend()
     ax2.grid(True, alpha=0.3)
-
+    
     plt.tight_layout()
-    plt.savefig("research_results_comparison.png", dpi=300)
-    print("📈 Comparison plots saved as 'research_results_comparison.png'")
+    plt.savefig("training_benchmarks.png")
     plt.show()
 
-def plot_manifold_slice(resnet, s_mean, s_std, a_mean, a_std):
+def plot_evaluation_comparison(results):
     """
-    Optional visualization of the learned safety manifold. 
-    Shows how Light Intensity is capped as Biomass (cx) increases.
+    Generates Comparative Histograms (Requirement 2):
+    Benchmarks ResNet vs. Non-ResNet vs. MPC on Reward and Safety[cite: 21, 23, 24].
+    'results' should be a dict: {'AgentName': {'reward': val, 'violations': val}}
     """
-    # Create a grid of cx (Biomass) and i_nom (Intended Light)
-    cx_grid = np.linspace(0.1, 5.0, 50)
-    i_nom_grid = np.linspace(0, 3000, 50)
-    CX, INOM = np.meshgrid(cx_grid, i_nom_grid)
-    
-    # Flatten for batch processing
-    states = np.zeros((CX.size, 3)) # [cx, cN, cq]
-    states[:, 0] = CX.flatten()
-    states[:, 1] = 50.0 # Fixed Nitrate for the slice
-    
-    nom_actions = np.zeros((INOM.size, 2)) # [I, Fn]
-    nom_actions[:, 0] = INOM.flatten()
-    nom_actions[:, 1] = 5.0 # Fixed Feed for the slice
-    
-    # Convert to Tensors and Normalize
-    device = next(resnet.parameters()).device
-    s_tensor = (torch.FloatTensor(states).to(device) - s_mean.to(device)) / s_std.to(device)
-    a_tensor = torch.FloatTensor(nom_actions).to(device)
-    
-    with torch.no_grad():
-        safe_actions = resnet(s_tensor, a_tensor)
-        i_safe = safe_actions[:, 0].cpu().numpy().reshape(CX.shape)
+    # Attempt to load MPC baseline if not already in results
+    if os.path.exists("mpc_results.csv"):
+        mpc_df = pd.read_csv("mpc_results.csv")
+        results['MPC Oracle'] = {
+            'reward': mpc_df['reward'].iloc[0],
+            'violations': mpc_df['violations'].iloc[0]
+        }
 
-    # Plot the heatmap of corrections
-    plt.figure(figsize=(8, 6))
-    plt.contourf(CX, INOM, i_safe, levels=50, cmap='viridis')
-    plt.colorbar(label='Safe Light Intensity ($\mu mol/m^2s$)')
-    plt.title("ResNet Learned Safety Boundary (Fixed $C_N=50, F_n=5$)")
-    plt.xlabel("Biomass ($C_x$)")
-    plt.ylabel("Intended Light Intensity ($I_{nom}$)")
-    plt.savefig("resnet_manifold_slice.png")
+    labels = list(results.keys())
+    rewards = [results[l]['reward'] for l in labels]
+    violations = [results[l]['violations'] for l in labels]
+
+    x = np.arange(len(labels))
+    width = 0.35
+
+    fig, ax1 = plt.subplots(figsize=(12, 7))
+
+    # Reward Bar 
+    rects1 = ax1.bar(x - width/2, rewards, width, label='Avg Reward', color='#2ecc71')
+    ax1.set_ylabel('Cumulative Reward')
+    ax1.set_title('Final Evaluation Benchmarks (RL vs. MPC Oracle)')
+    ax1.set_xticks(x)
+    ax1.set_xticklabels(labels)
+    
+    # Violation Bar (Secondary Axis) 
+    ax2 = ax1.twinx()
+    rects2 = ax2.bar(x + width/2, violations, width, label='Violations', color='#e74c3c')
+    ax2.set_ylabel('Avg Violations per Episode')
+    
+    # Combined legend
+    lines, labels_lg = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax2.legend(lines + lines2, labels_lg + labels2, loc='upper left')
+
+    fig.tight_layout()
+    plt.savefig("evaluation_comparison.png")
+    plt.show()
+
+def plot_temporal_dynamics(rl_trajectories):
+    """
+    Generates Temporal Dynamics (Requirement 3):
+    Phycocyanin production vs. time comparing RL to MPC baseline.
+    'rl_trajectories' should be a dict of lists containing 'cq' over time.
+    """
+    plt.figure(figsize=(12, 6))
+    
+    # Plot RL Variants
+    for name, data in rl_trajectories.items():
+        plt.plot(data, label=name, linewidth=2, alpha=0.8)
+    
+    # Load and Plot MPC Baseline 
+    if os.path.exists("mpc_trajectory.npy"):
+        mpc_data = np.load("mpc_trajectory.npy")
+        plt.plot(mpc_data, label="MPC Oracle (Baseline)", color='black', linestyle='--', linewidth=2.5)
+    
+    plt.title("Temporal Dynamics: Phycocyanin Production (cq) Over Time")
+    plt.xlabel("Time Step (Total: 7,200 Steps)")
+    plt.ylabel("Phycocyanin Concentration (cq)")
+    plt.legend()
+    plt.grid(True, linestyle='--', alpha=0.6)
+    plt.savefig("production_dynamics.png")
     plt.show()

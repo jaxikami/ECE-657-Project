@@ -1,150 +1,153 @@
 import os
-# 1. FIX OPENMP RUNTIME ERROR: Prevents the "Error #15" initialization crash 
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 import torch
 import numpy as np
-from env import create_env
-from agent import PPOAgent, PPOBuffer
-from pretrain import SmartSteeringWheel
-from utils import Logger, plot_training_results
+import pandas as pd
+from env import PhycocyaninSafeEnv
+from lag_agent import NonResNet_Agent
+from res_net_agent import SPRL_Agent
+from mpc import evaluate_mpc
+from utils import Logger, plot_training_results, plot_evaluation_comparison, plot_temporal_dynamics
 
-def run_experiment(use_resnet=False, total_episodes=50000, max_steps=7200):
+# Fix for OpenMP runtime conflict 
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
+def train_agent(use_resnet=False, total_episodes=50000, max_steps=7200):
     """
-    Runs a full training experiment. 
-    If use_resnet=True, the agent's actions are projected by the Smart Steering Wheel.
+    Executes a 50,000 episode training run for a specific agent type.
     """
     experiment_name = "ResNet_Guided_PPO" if use_resnet else "Baseline_Lagrangian_PPO"
-    print(f"\n🚀 Starting Experiment: {experiment_name}")
+    print(f"\n🚀 Starting Training: {experiment_name}")
     
-    env = create_env()
+    env = PhycocyaninSafeEnv()
     state_dim = env.observation_space.shape[0]
-    action_dim = env.action_space.shape[1] 
+    action_dim = env.action_space.shape[0]
     
-    # 1. Initialize ResNet if required
-    resnet = None
+    # Hyperparameters based on project architecture [cite: 14, 15]
+    params = {
+        'state_dim': state_dim,
+        'action_dim': action_dim,
+        'lr_actor': 3e-4,
+        'lr_critic': 1e-3,
+        'gamma': 0.99,
+        'K_epochs': 40,
+        'eps_clip': 0.2
+    }
+
     if use_resnet:
-        resnet = SmartSteeringWheel(state_dim=state_dim, action_dim=action_dim).to('cuda' if torch.cuda.is_available() else 'cpu')
-        # Load the pretrained weights from pretrain.py
-        try:
-            resnet.load_state_dict(torch.load("smart_steering_wheel.pth", weights_only=True))
-            resnet.eval()
-            print("✅ Pretrained ResNet loaded successfully.")
-        except FileNotFoundError:
-            print("❌ Error: smart_steering_wheel.pth not found. Run pretrain.py first.")
-            return None
+        agent = SPRL_Agent(**params, entropy_coeff=0.01, latent_dim=action_dim)
+    else:
+        agent = NonResNet_Agent(**params)
 
-    # 2. Initialize Agent and Buffer
-    agent = PPOAgent(state_dim, action_dim, resnet_model=resnet)
-    buffer = PPOBuffer()
     logger = Logger(experiment_name)
+    
+    class Memory:
+        def __init__(self):
+            self.actions, self.states, self.logprobs, self.rewards, self.is_terminals = [], [], [], [], []
+        def clear(self):
+            del self.actions[:], self.states[:], self.logprobs[:], self.rewards[:], self.is_terminals[:]
 
-    # 3. Training Loop
+    memory = Memory()
+    
     for episode in range(1, total_episodes + 1):
-        state, _ = env.reset()
+        state = env.reset()
         episode_reward = 0
+        violated = False
         
         for t in range(max_steps):
-            # Agent outputs nominal action; internal logic handles ResNet projection
-            nom_act, safe_act, logprob, val = agent.select_action(state)
+            # Select action (SP-RL handles internal projection) [cite: 15]
+            action, latent_or_nom, logprob = agent.select_action(state)
             
-            # Step environment with the SAFE action
-            next_state, reward, done, trunc, info = env.step(safe_act)
+            next_state, reward, done, info = env.step(action)
             
-            # Store data (PPO learns mapping from state to the INTENDED action)
-            buffer.states.append(state)
-            buffer.actions.append(nom_act)
-            buffer.logprobs.append(logprob)
-            buffer.rewards.append(reward)
-            buffer.is_terminals.append(done or trunc)
+            # Store transition
+            memory.states.append(torch.FloatTensor(state))
+            memory.actions.append(torch.FloatTensor(latent_or_nom))
+            memory.logprobs.append(torch.FloatTensor(logprob))
+            memory.rewards.append(reward)
+            memory.is_terminals.append(done)
             
             state = next_state
             episode_reward += reward
+            if info.get('constraint_violated', False):
+                violated = True
             
-            # Update PPO every 2000 steps
-            if (t + 1) % 2000 == 0:
-                agent.update(buffer)
-                buffer.clear()
-
-            if done or trunc:
-                break
+            if done: break
+            
+        # Update PPO policy
+        agent.learn(memory)
+        memory.clear()
         
-        logger.log_episode(episode_reward, info.get('is_violated', False))
+        logger.log_episode(episode_reward, violated)
         
         if episode % 100 == 0:
-            logger.print_status(episode, total_episodes)
-            
-        # Periodic Checkpointing
-        if episode % 5000 == 0:
-            torch.save(agent.policy.state_dict(), f"weights/{experiment_name}_ep{episode}.pth")
+            avg_r = logger.avg_rewards[-1]
+            v_rate = logger.violation_rates[-1]
+            print(f"Ep {episode} | Avg Reward: {avg_r:.2f} | Violation Rate: {v_rate:.1f}%")
 
-    # Save final model
-    save_path = f"{experiment_name}_final.pth"
-    torch.save(agent.policy.state_dict(), save_path)
-    print(f"✅ Training complete. Saved to {save_path}")
-    return logger
+    # Save final model 
+    torch.save(agent.policy.state_dict(), f"{experiment_name}_final.pth")
+    logger.save_data()
+    return agent, logger
 
-def evaluate_agent(model_path, use_resnet=False, episodes=100, noise_std=0.05):
+def run_evaluation(agent, name, episodes=100, max_steps=7200):
     """
-    Evaluation phase: 100 episodes with Gaussian noise and NO exploration.
+    Deterministic evaluation phase.
     """
-    print(f"\n🧪 Evaluating {model_path}...")
-    env = create_env()
-    state_dim = env.observation_space.shape[0]
-    action_dim = env.action_space.shape[1]
-    
-    resnet = None
-    if use_resnet:
-        resnet = SmartSteeringWheel(state_dim, action_dim).to('cuda' if torch.cuda.is_available() else 'cpu')
-        resnet.load_state_dict(torch.load("smart_steering_wheel.pth", weights_only=True))
-        resnet.eval()
-
-    agent = PPOAgent(state_dim, action_dim, resnet_model=resnet)
-    agent.policy.load_state_dict(torch.load(model_path, weights_only=True))
-    
-    violations = 0
+    print(f"🧪 Evaluating {name}...")
+    env = PhycocyaninSafeEnv()
     total_rewards = []
+    total_violations = 0
+    trajectory = []
 
-    for _ in range(episodes):
-        state, _ = env.reset()
+    for ep in range(episodes):
+        state = env.reset()
         ep_reward = 0
-        for _ in range(7200):
-            # evaluate=True uses the mean (exploitation)
-            _, safe_act, _, _ = agent.select_action(state, evaluate=True)
-            
-            # Add Gaussian noise to simulate sensor/actuator uncertainty
-            noise = np.random.normal(0, noise_std, size=safe_act.shape)
-            noisy_action = safe_act + noise
-            
-            state, reward, done, trunc, info = env.step(noisy_action)
+        for t in range(max_steps):
+            # Deterministic selection (exploitation)
+            action, _, _ = agent.select_action(state)
+            state, reward, done, info = env.step(action)
             ep_reward += reward
-            if info.get('is_violated', False):
-                violations += 1
-            if done or trunc: break
+            if info.get('constraint_violated', False):
+                total_violations += 1
+            if ep == 0: trajectory.append(state[2]) # Track cq [cite: 26]
+            if done: break
         total_rewards.append(ep_reward)
-    
-    avg_reward = np.mean(total_rewards)
-    violation_rate = (violations / (episodes * 7200)) * 100
-    return avg_reward, violation_rate
+
+    return {
+        'reward': np.mean(total_rewards),
+        'violations': total_violations / episodes,
+        'trajectory': trajectory
+    }
 
 if __name__ == "__main__":
-    if not os.path.exists("weights"): os.makedirs("weights")
+    # 1. Train both agents 
+    lag_agent, lag_logger = train_agent(use_resnet=False)
+    res_agent, res_logger = train_agent(use_resnet=True)
+
+    # 2. Benchmark against MPC Oracle [cite: 17, 26]
+    print("\n--- Final Benchmarking ---")
+    mpc_results = evaluate_mpc() # From mpc.py
     
-    # 1. Run Baseline (Lagrangian/Penalty only)
-    baseline_logger = run_experiment(use_resnet=False)
+    lag_eval = run_evaluation(lag_agent, "Baseline Lagrangian")
+    res_eval = run_evaluation(res_agent, "ResNet Guided")
+
+    # 3. Visualization and Metrics [cite: 19]
+    # Learning Curves (Requirement 1)
+    plot_training_results([lag_logger, res_logger])
+
+    # Comparative Histograms (Requirement 2)
+    eval_metrics = {
+        'Baseline PPO': {'reward': lag_eval['reward'], 'violations': lag_eval['violations']},
+        'ResNet PPO': {'reward': res_eval['reward'], 'violations': res_eval['violations']},
+        'MPC Oracle': {'reward': mpc_results['reward'], 'violations': mpc_results['violations_per_ep']}
+    }
+    plot_evaluation_comparison(eval_metrics)
+
+    # Temporal Dynamics (Requirement 3)
+    trajectories = {
+        'Baseline PPO': lag_eval['trajectory'],
+        'ResNet PPO': res_eval['trajectory']
+    }
+    plot_temporal_dynamics(trajectories)
     
-    # 2. Run Proposed (With ResNet Steering)
-    resnet_logger = run_experiment(use_resnet=True)
-    
-    # 3. Final Evaluation Comparison
-    b_rew, b_viol = evaluate_agent("Baseline_Lagrangian_PPO_final.pth", use_resnet=False)
-    r_rew, r_viol = evaluate_agent("ResNet_Guided_PPO_final.pth", use_resnet=True)
-    
-    print("\n" + "="*40)
-    print("      FINAL RESEARCH RESULTS")
-    print("="*40)
-    print(f"Baseline PPO | Reward: {b_rew:8.2f} | Violations: {b_viol:.4f}%")
-    print(f"ResNet PPO   | Reward: {r_rew:8.2f} | Violations: {r_viol:.4f}%")
-    print("="*40)
-    
-    # Generate Comparison Plots
-    plot_training_results(baseline_logger, resnet_logger)
+    print("\n✅ Benchmarking complete. All plots saved.")

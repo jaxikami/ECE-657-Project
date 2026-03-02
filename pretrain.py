@@ -37,7 +37,7 @@ class ActionProjectionNetwork(nn.Module):
         delta_norm = self.net(x)
         return nom_act_norm + delta_norm
 
-def run_pretraining(epochs=5000, batch_size=1024, buffer_size=200000, refresh_interval=100):
+def run_pretraining(epochs=10000, batch_size=8192, buffer_size=200000, refresh_interval=100):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = ActionProjectionNetwork().to(device)
     
@@ -64,9 +64,9 @@ def run_pretraining(epochs=5000, batch_size=1024, buffer_size=200000, refresh_in
     lr_history = []
     
     # --- Per-Buffer Success Config ---
-    early_stop_threshold = 5e-4
+    early_stop_threshold = 3e-4
     required_success_per_buffer = 90
-    start_monitoring_epoch = 1500
+    start_monitoring_epoch = 3000
     buffer_success_count = 0 # This resets every refresh
     
     # 3. Training Loop

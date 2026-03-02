@@ -34,7 +34,7 @@ class PhycocyaninSafeEnv:
         # 1. Execute step in pc-gym simulation
         next_state, reward, terminated, truncated, info = self.env.step(action)
         cx, cN, cq = next_state
-        
+        production_reward = cq * 0.1
         # 2. Calculate Photoinhibition Limit
         i_limit = self._get_i_limit(cx)
         
@@ -53,7 +53,7 @@ class PhycocyaninSafeEnv:
         # 5. Apply Lagrangian Penalty (Scaled 0-1 then * 10)
         # This creates a penalty of up to -10.0
         lagrangian_penalty = total_scaled_violation * 10.0
-        total_reward = reward - lagrangian_penalty
+        total_reward = reward - lagrangian_penalty + production_reward
         
         # 6. Early Stopping: End run immediately if any constraint is hit
         violated = (v_n > 0 or v_i > 0)
