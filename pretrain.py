@@ -65,8 +65,8 @@ def run_pretraining(epochs=5000, batch_size=1024, buffer_size=200000, refresh_in
     
     # --- Per-Buffer Success Config ---
     early_stop_threshold = 5e-4
-    required_success_per_buffer = 80
-    start_monitoring_epoch = 2000
+    required_success_per_buffer = 90
+    start_monitoring_epoch = 1500
     buffer_success_count = 0 # This resets every refresh
     
     # 3. Training Loop
@@ -147,17 +147,33 @@ def run_pretraining(epochs=5000, batch_size=1024, buffer_size=200000, refresh_in
     # --- Plotting ---
     plt.style.use('seaborn-v0_8-muted')
     fig, ax1 = plt.subplots(figsize=(12, 7))
+
+    # Calculate Moving Average (200 episodes)
+    window = 200
+    if len(history) >= window:
+        moving_avg = np.convolve(history, np.ones(window)/window, mode='valid')
+        # Pad with NaNs so the moving average line aligns with the history index
+        moving_avg_padded = np.concatenate([np.full(window-1, np.nan), moving_avg])
+    else:
+        moving_avg_padded = np.full(len(history), np.nan)
+
+    # 1. Raw Training Loss
     ax1.set_xlabel('Epochs')
-    ax1.set_ylabel('SmoothL1 Loss', color='#2c3e50')
-    ax1.plot(history, color='#2c3e50', alpha=0.8, label='Training Loss')
-    ax1.axhline(y=early_stop_threshold, color='r', linestyle='--', alpha=0.3, label='Exit Threshold')
+    ax1.set_ylabel('SmoothL1 Loss')
+    ax1.plot(history, color='#2c3e50', alpha=0.3, linewidth=1, label='Raw Epoch Loss')
+    
+    # 2. Moving Average
+    ax1.plot(moving_avg_padded, color='#e74c3c', linewidth=2, label=f'{window}-Epoch Moving Average')
+    
+    # 3. Success Threshold
+    ax1.axhline(y=early_stop_threshold, color='green', linestyle='--', alpha=0.6, label=f'Target ({early_stop_threshold:.1e})')
+
+    # Styling
     ax1.set_yscale('log')
+    ax1.grid(True, which="both", linestyle="--", alpha=0.4)
+    plt.title(f"Loss vs Epochs")
+    plt.legend(loc='upper right')
     
-    ax2 = ax1.twinx()
-    ax2.set_ylabel('Learning Rate', color='#e74c3c')
-    ax2.plot(lr_history, color='#e74c3c', linestyle=':', label='Learning Rate')
-    
-    plt.title(f"Buffer Mastery: {required_success_per_buffer} Successes per {refresh_interval} Epochs")
     fig.tight_layout()
     plt.savefig("manifold_convergence.png", dpi=300)
     plt.show()
