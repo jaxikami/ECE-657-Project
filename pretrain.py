@@ -12,10 +12,6 @@ from tqdm import tqdm
 from data_gen import get_fresh_batch_dataset
 
 class ActionProjectionNetwork(nn.Module):
-    """
-    Neural safety layer for projecting nominal actions onto 
-    the constrained manifold of the photoproduction process.
-    """
     def __init__(self, state_dim=3, action_dim=2, latent_dim=1024):
         super(ActionProjectionNetwork, self).__init__()
         self.net = nn.Sequential(
@@ -41,7 +37,12 @@ def run_pretraining(epochs=10000, batch_size=8192, buffer_size=200000, refresh_i
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = ActionProjectionNetwork().to(device)
     
-    # 1. Normalization Setup
+    # To ensure stable gradients and faster convergence, we compute global statistics 
+    # (mean and standard deviation) from a large sample of the state-action space.
+    # These constants "standardize" the inputs so the network isn't overwhelmed by 
+    # differing scales between physical units (e.g., velocity vs. position).
+    # Crucial for ensuring that during real-time deployment (inference), 
+    # the model uses the exact same scaling it learned during training.
     print("Initializing manifold normalization constants...")
     s_init, a_init, _ = get_fresh_batch_dataset(500000)
     s_mean, s_std = s_init.mean(0), s_init.std(0)
@@ -54,41 +55,88 @@ def run_pretraining(epochs=10000, batch_size=8192, buffer_size=200000, refresh_i
     s_m, s_s = s_mean.to(device), s_std.to(device)
     a_m, a_s = a_mean.to(device), a_std.to(device)
 
-    # 2. Optimization Config
+    # Hyperparameters with lr decay
     initial_lr = 5e-4
     optimizer = optim.Adam(model.parameters(), lr=initial_lr)
     decay_end_epoch = (2 / 3) * epochs
     criterion = nn.SmoothL1Loss(beta=0.1)
-
     history = []
     lr_history = []
     
-    # --- Per-Buffer Success Config ---
+    # Early Stopping Logic
+# 1. LATENCY PERIOD (start_monitoring_epoch): 
+#    We wait 3,000 epochs before checking for success. This prevents the 
+#    model from "tripping" the exit early while the loss is still volatile 
+#    during the initial high-learning-rate phase.
+#
+# 2. PRECISION TARGET (early_stop_threshold): 
+#    The model must achieve an Average SmoothL1 Loss of 3e-4 or lower. 
+#    This defines the mathematical "closeness" required for the projected 
+#    action to be considered safe.
+#
+# 3. CONSISTENCY REQUIREMENT (required_success_per_buffer): 
+#    Achieving the threshold once isn't enough. The model must maintain 
+#    that precision for 90 epochs within a single data refresh cycle. 
+#    This proves the model isn't just "passing through" a lucky local 
+#    minimum but has actually converged.
+#
+# 4. BUFFER RESET (buffer_success_count): 
+#    Because get_fresh_batch_dataset() generates new data every 100 
+#    epochs (refresh_interval), we reset the success count to zero. 
+#    The model must "prove its mastery" all over again on the new data 
+#    to ensure it hasn't overfit to the previous buffer.
+
     early_stop_threshold = 3e-4
     required_success_per_buffer = 90
     start_monitoring_epoch = 3000
-    buffer_success_count = 0 # This resets every refresh
+    buffer_success_count = 0
     
-    # 3. Training Loop
     pbar = tqdm(range(epochs), desc="Training Safety Manifold")
     
     for epoch in pbar:
         buffer_age = epoch % refresh_interval
-        
-        # PERIODIC REFRESH
         noise_scale = max(1e-3, 1e-2 * (1.0 - (epoch / start_monitoring_epoch)))
         
+        # This block executes every 'refresh_interval' (e.g., 100 epochs) to prevent 
+        # the model from over-specializing on a single static dataset.
+        #
+        # 1. RESET SUCCESS COUNT: 
+        #    We zero out 'buffer_success_count'. The model must prove its 
+        #    accuracy from scratch on the new data to ensure it hasn't overfit 
+        #    to the previous samples.
+        #
+        # 2. WHY WE ADD NOISE (Gaussian Blurring): 
+        #    We inject random noise scaled by 'noise_scale' into the raw states 
+        #    and actions. This serves three vital purposes:
+        #    - ROBUSTNESS: In the real world, sensors are noisy. Training on 
+        #      "blurred" data forces the network to learn the general shape of 
+        #      the safety manifold rather than just memorizing exact points.
+        #    - MANIFOLD "SHARPENING": Early in training, high noise helps the 
+        #      network find the broad "safe zone." As noise_scale decays over 
+        #      epochs, the model "sharpens" its focus, eventually learning the 
+        #      precise boundary of the manifold.
+        #    - COVERAGE: It ensures that the model sees data slightly outside 
+        #      the standard distribution, helping it handle "out-of-bounds" 
+        #      scenarios during real-time safety projection.
+        #
+        # 3. ON-THE-FLY NORMALIZATION: 
+        #    Raw data is immediately shifted and scaled using the global 
+        #    constants (s_m, s_s, etc.). This keeps all inputs within 
+        #    a range (typically -1 to 1) that the neural network can process 
+        #    without numerical instability.
+        #
+        # 4. LEARNING RATE BUMP: 
+        #    When new data is introduced (if epoch > 0), we slightly reset 
+        #    the LR to 80% of its initial value. This "jolt" provides 
+        #    enough momentum for the optimizer to adapt to the new data 
+        #    distribution before the standard decay logic takes back over.
         if buffer_age == 0:
-            # RESET SUCCESS COUNT FOR THE NEW BUFFER
             buffer_success_count = 0
-            
             s_raw, a_raw, y_target = get_fresh_batch_dataset(buffer_size)
             
-            # --- Blurring with Noise Decay ---
-            # As noise_scale approaches 0, the manifold becomes "sharper" for the agent.
-            if noise_scale > 0:
-                s_raw = s_raw + torch.randn_like(s_raw) * (s_raw.std(0) * noise_scale)
-                a_raw = a_raw + torch.randn_like(a_raw) * (a_raw.std(0) * noise_scale)
+            
+            s_raw = s_raw + torch.randn_like(s_raw) * (s_raw.std(0) * noise_scale)
+            a_raw = a_raw + torch.randn_like(a_raw) * (a_raw.std(0) * noise_scale)
             
             s_norm = (s_raw.to(device) - s_m) / (s_s + 1e-8)
             a_norm = (a_raw.to(device) - a_m) / (a_s + 1e-8)
@@ -101,7 +149,7 @@ def run_pretraining(epochs=10000, batch_size=8192, buffer_size=200000, refresh_i
                 for param_group in optimizer.param_groups:
                     param_group['lr'] = initial_lr * 0.8
 
-        # LR Decay logic
+        # LR Decay
         if buffer_age != 0:
             lr_coeff = max(0.0, 1.0 - (epoch / decay_end_epoch))
             current_lr = max(1e-7, initial_lr * lr_coeff)
