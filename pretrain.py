@@ -10,21 +10,21 @@ import numpy as np
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 from data_gen import get_fresh_batch_dataset
-
+from torch.amp import autocast, GradScaler
 class ActionProjectionNetwork(nn.Module):
-    def __init__(self, state_dim=3, action_dim=2, latent_dim=1024):
+    def __init__(self, state_dim=3, action_dim=2, latent_dim=512):
         super(ActionProjectionNetwork, self).__init__()
         self.net = nn.Sequential(
             nn.Linear(state_dim + action_dim, latent_dim),
             nn.LayerNorm(latent_dim),
-            nn.LeakyReLU(0.2),
+            nn.ELU(),
             
             nn.Linear(latent_dim, latent_dim),
             nn.LayerNorm(latent_dim),
-            nn.LeakyReLU(0.2),
+            nn.ELU(),
             
             nn.Linear(latent_dim, latent_dim // 2),
-            nn.LeakyReLU(0.2),
+            nn.ELU(),
             nn.Linear(latent_dim // 2, action_dim) 
         )
 
@@ -33,7 +33,7 @@ class ActionProjectionNetwork(nn.Module):
         delta_norm = self.net(x)
         return nom_act_norm + delta_norm
 
-def run_pretraining(epochs=10000, batch_size=8192, buffer_size=200000, refresh_interval=100):
+def run_pretraining(epochs=6000, batch_size=8192, buffer_size=450000, refresh_interval=100):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = ActionProjectionNetwork().to(device)
     
@@ -56,7 +56,7 @@ def run_pretraining(epochs=10000, batch_size=8192, buffer_size=200000, refresh_i
     a_m, a_s = a_mean.to(device), a_std.to(device)
 
     # Hyperparameters with lr decay
-    initial_lr = 5e-4
+    initial_lr = 1e-3
     optimizer = optim.Adam(model.parameters(), lr=initial_lr)
     decay_end_epoch = (2 / 3) * epochs
     criterion = nn.SmoothL1Loss(beta=0.1)
@@ -76,23 +76,22 @@ def run_pretraining(epochs=10000, batch_size=8192, buffer_size=200000, refresh_i
 #
 # 3. CONSISTENCY REQUIREMENT (required_success_per_buffer): 
 #    Achieving the threshold once isn't enough. The model must maintain 
-#    that precision for 90 epochs within a single data refresh cycle. 
+#    that precision for 80 epochs within a single data refresh cycle. 
 #    This proves the model isn't just "passing through" a lucky local 
 #    minimum but has actually converged.
 #
 # 4. BUFFER RESET (buffer_success_count): 
-#    Because get_fresh_batch_dataset() generates new data every 100 
-#    epochs (refresh_interval), we reset the success count to zero. 
+#    Because get_fresh_batch_dataset() generates new data every 100 epochs (refresh_interval), we reset the success count to zero. 
 #    The model must "prove its mastery" all over again on the new data 
 #    to ensure it hasn't overfit to the previous buffer.
 
-    early_stop_threshold = 3e-4
-    required_success_per_buffer = 90
+    early_stop_threshold = 5e-4
+    required_success_per_buffer = 80
     start_monitoring_epoch = 3000
     buffer_success_count = 0
     
     pbar = tqdm(range(epochs), desc="Training Safety Manifold")
-    
+    scaler = GradScaler('cuda')
     for epoch in pbar:
         buffer_age = epoch % refresh_interval
         noise_scale = max(1e-3, 1e-2 * (1.0 - (epoch / start_monitoring_epoch)))
@@ -163,11 +162,21 @@ def run_pretraining(epochs=10000, batch_size=8192, buffer_size=200000, refresh_i
         epoch_loss = 0
         for b_s, b_a, b_y in loader:
             optimizer.zero_grad()
-            pred_y = model(b_s, b_a)
-            loss = criterion(pred_y, b_y)
-            loss.backward()
+            # 1. Runs the forward pass with autocasting
+            with autocast(device_type='cuda'):
+                pred_y = model(b_s, b_a)
+                loss = criterion(pred_y, b_y)
+
+            # Scaler logic remains similar but uses the new instance
+            scaler.scale(loss).backward()
+            
+            # Unscale for gradient clipping to prevent exploding gradients
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
+            
+            scaler.step(optimizer)
+            scaler.update()
+            
             epoch_loss += loss.item()
             
         avg_loss = epoch_loss / len(loader)
