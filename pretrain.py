@@ -11,11 +11,13 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 from data_gen import get_fresh_batch_dataset
 
-# 1. High-Capacity Smart Steering Wheel with LayerNorm
-class SmartSteeringWheel(nn.Module):
+class ActionProjectionNetwork(nn.Module):
+    """
+    Neural safety layer for projecting nominal actions onto 
+    the constrained manifold of the photoproduction process.
+    """
     def __init__(self, state_dim=3, action_dim=2, latent_dim=1024):
-        super(SmartSteeringWheel, self).__init__()
-        # LayerNorm stabilizes the deep mapping of the photoproduction manifold
+        super(ActionProjectionNetwork, self).__init__()
         self.net = nn.Sequential(
             nn.Linear(state_dim + action_dim, latent_dim),
             nn.LayerNorm(latent_dim),
@@ -31,20 +33,19 @@ class SmartSteeringWheel(nn.Module):
         )
 
     def forward(self, state_norm, nom_act_norm):
-        """Residual Bridge: Safe = Nominal + Delta"""
         x = torch.cat([state_norm, nom_act_norm], dim=1)
         delta_norm = self.net(x)
         return nom_act_norm + delta_norm
 
-def run_pretraining(epochs=3000, batch_size=512, samples_per_epoch=20000):
+def run_pretraining(epochs=5000, batch_size=1024, buffer_size=200000, refresh_interval=100):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = SmartSteeringWheel().to(device)
+    model = ActionProjectionNetwork().to(device)
     
-    # Pre-calculate normalization constants from a large sample
-    print("📊 Calculating manifold normalization constants...")
-    s_raw, a_raw, _ = get_fresh_batch_dataset(100000)
-    s_mean, s_std = s_raw.mean(0), s_raw.std(0)
-    a_mean, a_std = a_raw.mean(0), a_raw.std(0)
+    # 1. Normalization Setup
+    print("Initializing manifold normalization constants...")
+    s_init, a_init, _ = get_fresh_batch_dataset(500000)
+    s_mean, s_std = s_init.mean(0), s_init.std(0)
+    a_mean, a_std = a_init.mean(0), a_init.std(0)
     
     np.savez("norm_constants.npz", 
              s_mean=s_mean.numpy(), s_std=s_std.numpy(), 
@@ -53,85 +54,112 @@ def run_pretraining(epochs=3000, batch_size=512, samples_per_epoch=20000):
     s_m, s_s = s_mean.to(device), s_std.to(device)
     a_m, a_s = a_mean.to(device), a_std.to(device)
 
-    # Optimization Setup: AdamW and HuberLoss for robustness
-    optimizer = optim.AdamW(model.parameters(), lr=5e-4, weight_decay=1e-4)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.3, patience=30)
-    criterion = nn.HuberLoss(delta=0.1) 
+    # 2. Optimization Config
+    initial_lr = 5e-4
+    optimizer = optim.Adam(model.parameters(), lr=initial_lr)
+    decay_end_epoch = (2 / 3) * epochs
+    criterion = nn.SmoothL1Loss(beta=0.1)
 
     history = []
-    print(f"🚀 Refinement Training on {device}...")
-    pbar = tqdm(range(epochs), desc="Refining Safety Manifold")
+    lr_history = []
+    
+    # --- Per-Buffer Success Config ---
+    early_stop_threshold = 5e-4
+    required_success_per_buffer = 80
+    start_monitoring_epoch = 2000
+    buffer_success_count = 0 # This resets every refresh
+    
+    # 3. Training Loop
+    pbar = tqdm(range(epochs), desc="Training Safety Manifold")
     
     for epoch in pbar:
-        # 1. Fresh Data Generation
-        s_data, a_data, y_data = get_fresh_batch_dataset(samples_per_epoch)
+        buffer_age = epoch % refresh_interval
         
-        # 2. Importance Sampling: Duplicate 'Hard' cases (large safety corrections)
-        delta_physical = torch.abs(y_data - a_data).sum(dim=1)
-        hard_indices = (delta_physical > 10.0).nonzero(as_tuple=True)[0]
+        # PERIODIC REFRESH
+        noise_scale = max(1e-3, 1e-2 * (1.0 - (epoch / start_monitoring_epoch)))
         
-        if len(hard_indices) > 0:
-            s_hard, a_hard, y_hard = s_data[hard_indices], a_data[hard_indices], y_data[hard_indices]
-            s_data = torch.cat([s_data, s_hard], dim=0)
-            a_data = torch.cat([a_data, a_hard], dim=0)
-            y_data = torch.cat([y_data, y_hard], dim=0)
+        if buffer_age == 0:
+            # RESET SUCCESS COUNT FOR THE NEW BUFFER
+            buffer_success_count = 0
+            
+            s_raw, a_raw, y_target = get_fresh_batch_dataset(buffer_size)
+            
+            # --- Blurring with Noise Decay ---
+            # As noise_scale approaches 0, the manifold becomes "sharper" for the agent.
+            if noise_scale > 0:
+                s_raw = s_raw + torch.randn_like(s_raw) * (s_raw.std(0) * noise_scale)
+                a_raw = a_raw + torch.randn_like(a_raw) * (a_raw.std(0) * noise_scale)
+            
+            s_norm = (s_raw.to(device) - s_m) / (s_s + 1e-8)
+            a_norm = (a_raw.to(device) - a_m) / (a_s + 1e-8)
+            y_norm = (y_target.to(device) - a_m) / (a_s + 1e-8)
+            
+            train_ds = TensorDataset(s_norm, a_norm, y_norm)
+            loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+            
+            if epoch > 0:
+                for param_group in optimizer.param_groups:
+                    param_group['lr'] = initial_lr * 0.8
 
-        # 3. Normalization
-        s_norm = (s_data.to(device) - s_m) / (s_s + 1e-8)
-        a_norm = (a_data.to(device) - a_m) / (a_s + 1e-8)
-        y_norm = (y_data.to(device) - a_m) / (a_s + 1e-8) 
-        
-        loader = DataLoader(TensorDataset(s_norm, a_norm, y_norm), batch_size=batch_size, shuffle=True)
-        
+        # LR Decay logic
+        if buffer_age != 0:
+            lr_coeff = max(0.0, 1.0 - (epoch / decay_end_epoch))
+            current_lr = max(1e-7, initial_lr * lr_coeff)
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = current_lr
+        else:
+            current_lr = optimizer.param_groups[0]['lr']
+
+        # Training Execution
         model.train()
         epoch_loss = 0
         for b_s, b_a, b_y in loader:
             optimizer.zero_grad()
-            pred_y_norm = model(b_s, b_a)
-            loss = criterion(pred_y_norm, b_y)
+            pred_y = model(b_s, b_a)
+            loss = criterion(pred_y, b_y)
             loss.backward()
-            
-            # Strict gradient clipping for the final refinement stage
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             epoch_loss += loss.item()
             
         avg_loss = epoch_loss / len(loader)
         history.append(avg_loss)
-        scheduler.step(avg_loss)
+        lr_history.append(current_lr)
 
-        # Update tqdm status with Loss and Learning Rate
-        pbar.set_postfix({'Loss': f'{avg_loss:.2e}', 'LR': f"{optimizer.param_groups[0]['lr']:.2e}"})
+        # --- Per-Buffer Early Exit Logic ---
+        if epoch >= start_monitoring_epoch:
+            if avg_loss < early_stop_threshold:
+                buffer_success_count += 1
 
-    # Save final weights
-    torch.save(model.state_dict(), "smart_steering_wheel.pth")
-    print("\n✅ Pretraining Finalized. Generating Plots...")
+        pbar.set_postfix({
+            'Loss': f'{avg_loss:.2e}', 
+            'BufSuccess': f"{buffer_success_count}/{required_success_per_buffer}",
+            'Age': buffer_age
+        })
 
-    # --- FINAL PLOTTING ---
+        if buffer_success_count >= required_success_per_buffer:
+            print(f"\n[Success] Mastery! {buffer_success_count} epochs below {early_stop_threshold} in current buffer.")
+            break
+
+    # Save weights
+    torch.save(model.state_dict(), "action_projection_network.pth")
+    
+    # --- Plotting ---
     plt.style.use('seaborn-v0_8-muted')
-    plt.figure(figsize=(10, 6))
+    fig, ax1 = plt.subplots(figsize=(12, 7))
+    ax1.set_xlabel('Epochs')
+    ax1.set_ylabel('SmoothL1 Loss', color='#2c3e50')
+    ax1.plot(history, color='#2c3e50', alpha=0.8, label='Training Loss')
+    ax1.axhline(y=early_stop_threshold, color='r', linestyle='--', alpha=0.3, label='Exit Threshold')
+    ax1.set_yscale('log')
     
-    # Main Loss Curve
-    plt.plot(history, color='#2c3e50', linewidth=1.5, label='Huber Loss (Normalized)')
+    ax2 = ax1.twinx()
+    ax2.set_ylabel('Learning Rate', color='#e74c3c')
+    ax2.plot(lr_history, color='#e74c3c', linestyle=':', label='Learning Rate')
     
-    # Formatting
-    plt.yscale('log')
-    plt.title("ResNet Convergence: Breaking the Safety Manifold Plateau")
-    plt.xlabel("Epochs")
-    plt.ylabel("Loss (Log Scale)")
-    plt.grid(True, which="both", linestyle="--", alpha=0.5)
-    
-    # Annotations
-    final_loss = history[-1]
-    plt.annotate(f'Final Loss: {final_loss:.2e}', 
-                 xy=(len(history)-1, final_loss), 
-                 xytext=(len(history)*0.7, final_loss*10),
-                 arrowprops=dict(facecolor='black', shrink=0.05, width=1, headwidth=5))
-
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig("pretrain_loss_curve.png", dpi=300)
-    print("📈 Plot saved as 'pretrain_loss_curve.png'")
+    plt.title(f"Buffer Mastery: {required_success_per_buffer} Successes per {refresh_interval} Epochs")
+    fig.tight_layout()
+    plt.savefig("manifold_convergence.png", dpi=300)
     plt.show()
 
 if __name__ == "__main__":

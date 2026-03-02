@@ -1,2 +1,8 @@
 
 *.pth
+
+__pycache__/
+
+*.png
+
+*.npz
