@@ -33,7 +33,7 @@ class ActionProjectionNetwork(nn.Module):
         delta_norm = self.net(x)
         return nom_act_norm + delta_norm
 
-def run_pretraining(epochs=6000, batch_size=8192, buffer_size=450000, refresh_interval=100):
+def run_pretraining(epochs=10000, batch_size=32768, buffer_size=2000000, refresh_interval=100):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = ActionProjectionNetwork().to(device)
     
