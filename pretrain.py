@@ -160,26 +160,35 @@ def run_pretraining(epochs=6000, batch_size=8192, buffer_size=450000, refresh_in
         # Training Execution
         model.train()
         epoch_loss = 0
-        for b_s, b_a, b_y in loader:
+        indices = torch.randperm(buffer_size, device=device)
+        
+        # 2. Iterate through the buffer using direct VRAM slicing 
+        for i in range(0, buffer_size, batch_size):
+            # Grab a slice of indices
+            batch_idx = indices[i : i + batch_size]
+            
+            # Direct slicing: No memory copying, just pointer offsets in VRAM
+            b_s = s_norm[batch_idx]
+            b_a = a_norm[batch_idx]
+            b_y = y_norm[batch_idx]
+
             optimizer.zero_grad()
-            # 1. Runs the forward pass with autocasting
+            
+            # Forward pass with mixed precision 
             with autocast(device_type='cuda'):
                 pred_y = model(b_s, b_a)
                 loss = criterion(pred_y, b_y)
 
-            # Scaler logic remains similar but uses the new instance
+            # High-throughput backprop
             scaler.scale(loss).backward()
-            
-            # Unscale for gradient clipping to prevent exploding gradients
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            
             scaler.step(optimizer)
             scaler.update()
             
             epoch_loss += loss.item()
             
-        avg_loss = epoch_loss / len(loader)
+        avg_loss = epoch_loss / (buffer_size / batch_size)
         history.append(avg_loss)
         lr_history.append(current_lr)
 
