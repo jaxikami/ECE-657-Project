@@ -1,153 +1,141 @@
-import os
 import torch
 import numpy as np
-import pandas as pd
-from env import PhycocyaninSafeEnv
+from tqdm import tqdm
+from env import PhotoProductionEnv
 from lag_agent import NonResNet_Agent
 from res_net_agent import SPRL_Agent
-from mpc import evaluate_mpc
-from utils import Logger, plot_training_results, plot_evaluation_comparison, plot_temporal_dynamics
+from utils import DataLogger, Plotter
 
-# Fix for OpenMP runtime conflict 
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+# --- Hyperparameters ---
+STATE_DIM = 3
+ACTION_DIM = 2
+LATENT_DIM = 2
+MAX_EPISODES = 500000 
+MAX_STEPS = 7200      
+UPDATE_TIMESTEP = 14400 
+K_EPOCHS = 40
+EPS_CLIP = 0.2
+GAMMA = 0.99
+LR_ACTOR = 3e-4
+LR_CRITIC = 1e-3
+MIN_LR = 1e-7  # Floor for decay
+ENTROPY_COEFF = 0.01
 
-def train_agent(use_resnet=False, total_episodes=50000, max_steps=7200):
-    """
-    Executes a 50,000 episode training run for a specific agent type.
-    """
-    experiment_name = "ResNet_Guided_PPO" if use_resnet else "Baseline_Lagrangian_PPO"
-    print(f"\n🚀 Starting Training: {experiment_name}")
+class Memory:
+    def __init__(self):
+        self.states, self.actions, self.logprobs, self.rewards, self.is_terminals = [], [], [], [], []
+    def clear(self):
+        del self.states[:], self.actions[:], self.logprobs[:], self.rewards[:], self.is_terminals[:]
+
+def apply_linear_decay(agent, episode, total_episodes, base_lr_actor, base_lr_critic):
+    """Calculates and applies linear decay to the optimizer param groups."""
+    lr_coeff = max(0.0, 1.0 - (episode / total_episodes))
     
-    env = PhycocyaninSafeEnv()
-    state_dim = env.observation_space.shape[0]
-    action_dim = env.action_space.shape[0]
+    current_lr_actor = max(MIN_LR, base_lr_actor * lr_coeff)
+    current_lr_critic = max(MIN_LR, base_lr_critic * lr_coeff)
     
-    # Hyperparameters based on project architecture [cite: 14, 15]
-    params = {
-        'state_dim': state_dim,
-        'action_dim': action_dim,
-        'lr_actor': 3e-4,
-        'lr_critic': 1e-3,
-        'gamma': 0.99,
-        'K_epochs': 40,
-        'eps_clip': 0.2
-    }
-
-    if use_resnet:
-        agent = SPRL_Agent(**params, entropy_coeff=0.01, latent_dim=action_dim)
-    else:
-        agent = NonResNet_Agent(**params)
-
-    logger = Logger(experiment_name)
+    # Update Actor (and log_std if applicable)
+    for i in range(len(agent.optimizer.param_groups) - 1):
+        agent.optimizer.param_groups[i]['lr'] = current_lr_actor
     
-    class Memory:
-        def __init__(self):
-            self.actions, self.states, self.logprobs, self.rewards, self.is_terminals = [], [], [], [], []
-        def clear(self):
-            del self.actions[:], self.states[:], self.logprobs[:], self.rewards[:], self.is_terminals[:]
+    # Update Critic (last param group in both agents)
+    agent.optimizer.param_groups[-1]['lr'] = current_lr_critic
+    
+    return current_lr_actor
 
+def train_agent(agent_name, agent, env, logger):
+    print(f"\n--- Starting Training: {agent_name} ---")
     memory = Memory()
+    time_step = 0
     
-    for episode in range(1, total_episodes + 1):
-        state = env.reset()
-        episode_reward = 0
-        violated = False
+    pbar = tqdm(range(1, MAX_EPISODES + 1), desc=f"Training {agent_name}")
+    for i_episode in pbar:
+        # --- Apply Linear Decay per Episode ---
+        current_lr = apply_linear_decay(agent, i_episode, MAX_EPISODES, LR_ACTOR, LR_CRITIC)
         
-        for t in range(max_steps):
-            # Select action (SP-RL handles internal projection) [cite: 15]
-            action, latent_or_nom, logprob = agent.select_action(state)
+        state = env.reset()
+        current_ep_reward = 0
+        
+        for t in range(MAX_STEPS):
+            time_step += 1
             
-            next_state, reward, done, info = env.step(action)
+            if agent_name == "SPRL":
+                action, latent, log_prob = agent.select_action(state)
+                memory.actions.append(torch.tensor(latent))
+            else:
+                action, log_prob = agent.select_action(state)
+                memory.actions.append(torch.tensor(action))
             
-            # Store transition
-            memory.states.append(torch.FloatTensor(state))
-            memory.actions.append(torch.FloatTensor(latent_or_nom))
-            memory.logprobs.append(torch.FloatTensor(logprob))
+            memory.states.append(torch.tensor(state))
+            memory.logprobs.append(torch.tensor(log_prob))
+            
+            state, reward, done, info = env.step(action)
+            
             memory.rewards.append(reward)
             memory.is_terminals.append(done)
+            current_ep_reward += reward
+            
+            if time_step % UPDATE_TIMESTEP == 0:
+                agent.learn(memory)
+                memory.clear()
+                time_step = 0
+            
+            if done: break
+            
+        logger.log_training_episode(agent_name, current_ep_reward)
+        if i_episode % 10 == 0:
+            pbar.set_postfix({
+                "Last Reward": f"{current_ep_reward:.2f}",
+                "LR": f"{current_lr:.2e}"
+            })
+
+def evaluate_agent(agent_name, agent, env, logger, eval_episodes=1000):
+    print(f"\n--- Evaluating: {agent_name} (Deterministic) ---")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    all_states, all_actions, all_rewards, all_infos = [], [], [], []
+    
+    for _ in tqdm(range(eval_episodes), desc=f"Eval {agent_name}"):
+        state = env.reset()
+        ep_states, ep_actions, ep_rewards, ep_infos = [], [], [], []
+        
+        for t in range(MAX_STEPS):
+            with torch.no_grad():
+                state_t = torch.FloatTensor(state).to(device)
+                if agent_name == "SPRL":
+                    z = agent.policy.actor_latent_mean(agent.policy.actor_base(state_t))
+                    s_norm = (state_t.unsqueeze(0) - agent.s_mean) / (agent.s_std + 1e-8)
+                    z_norm = (z.unsqueeze(0) - agent.a_mean) / (agent.a_std + 1e-8)
+                    action_norm = agent.safeguard(s_norm, z_norm)
+                    action = (action_norm * (agent.a_std + 1e-8)) + agent.a_mean
+                    action = action.cpu().numpy().flatten()
+                else:
+                    action = agent.policy.actor(state_t).cpu().numpy().flatten()
+            
+            next_state, reward, done, info = env.step(action)
+            ep_states.append(state)
+            ep_actions.append(action)
+            ep_rewards.append(reward)
+            ep_infos.append(info)
             
             state = next_state
-            episode_reward += reward
-            if info.get('constraint_violated', False):
-                violated = True
-            
             if done: break
             
-        # Update PPO policy
-        agent.learn(memory)
-        memory.clear()
-        
-        logger.log_episode(episode_reward, violated)
-        
-        if episode % 100 == 0:
-            avg_r = logger.avg_rewards[-1]
-            v_rate = logger.violation_rates[-1]
-            print(f"Ep {episode} | Avg Reward: {avg_r:.2f} | Violation Rate: {v_rate:.1f}%")
+        all_states, all_actions, all_rewards, all_infos = ep_states, ep_actions, ep_rewards, ep_infos
 
-    # Save final model 
-    torch.save(agent.policy.state_dict(), f"{experiment_name}_final.pth")
-    logger.save_data()
-    return agent, logger
-
-def run_evaluation(agent, name, episodes=100, max_steps=7200):
-    """
-    Deterministic evaluation phase.
-    """
-    print(f"🧪 Evaluating {name}...")
-    env = PhycocyaninSafeEnv()
-    total_rewards = []
-    total_violations = 0
-    trajectory = []
-
-    for ep in range(episodes):
-        state = env.reset()
-        ep_reward = 0
-        for t in range(max_steps):
-            # Deterministic selection (exploitation)
-            action, _, _ = agent.select_action(state)
-            state, reward, done, info = env.step(action)
-            ep_reward += reward
-            if info.get('constraint_violated', False):
-                total_violations += 1
-            if ep == 0: trajectory.append(state[2]) # Track cq [cite: 26]
-            if done: break
-        total_rewards.append(ep_reward)
-
-    return {
-        'reward': np.mean(total_rewards),
-        'violations': total_violations / episodes,
-        'trajectory': trajectory
-    }
+    logger.log_evaluation_trajectory(agent_name, all_states, all_actions, all_rewards, all_infos)
 
 if __name__ == "__main__":
-    # 1. Train both agents 
-    lag_agent, lag_logger = train_agent(use_resnet=False)
-    res_agent, res_logger = train_agent(use_resnet=True)
-
-    # 2. Benchmark against MPC Oracle [cite: 17, 26]
-    print("\n--- Final Benchmarking ---")
-    mpc_results = evaluate_mpc() # From mpc.py
+    env = PhotoProductionEnv()
+    logger = DataLogger()
     
-    lag_eval = run_evaluation(lag_agent, "Baseline Lagrangian")
-    res_eval = run_evaluation(res_agent, "ResNet Guided")
-
-    # 3. Visualization and Metrics [cite: 19]
-    # Learning Curves (Requirement 1)
-    plot_training_results([lag_logger, res_logger])
-
-    # Comparative Histograms (Requirement 2)
-    eval_metrics = {
-        'Baseline PPO': {'reward': lag_eval['reward'], 'violations': lag_eval['violations']},
-        'ResNet PPO': {'reward': res_eval['reward'], 'violations': res_eval['violations']},
-        'MPC Oracle': {'reward': mpc_results['reward'], 'violations': mpc_results['violations_per_ep']}
-    }
-    plot_evaluation_comparison(eval_metrics)
-
-    # Temporal Dynamics (Requirement 3)
-    trajectories = {
-        'Baseline PPO': lag_eval['trajectory'],
-        'ResNet PPO': res_eval['trajectory']
-    }
-    plot_temporal_dynamics(trajectories)
+    lag_agent = NonResNet_Agent(STATE_DIM, ACTION_DIM, LR_ACTOR, LR_CRITIC, GAMMA, K_EPOCHS, EPS_CLIP)
+    sprl_agent = SPRL_Agent(STATE_DIM, ACTION_DIM, LR_ACTOR, LR_CRITIC, GAMMA, K_EPOCHS, EPS_CLIP, ENTROPY_COEFF, LATENT_DIM)
     
-    print("\n✅ Benchmarking complete. All plots saved.")
+    train_agent("NonResNet", lag_agent, env, logger)
+    train_agent("SPRL", sprl_agent, env, logger)
+    
+    evaluate_agent("NonResNet", lag_agent, env, logger)
+    evaluate_agent("SPRL", sprl_agent, env, logger)
+    
+    Plotter.plot_training_results(logger.training_log)
+    Plotter.plot_evaluation_trajectories(logger.eval_data)

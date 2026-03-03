@@ -1,138 +1,96 @@
-import os
-import numpy as np
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 import torch
 
-# Fix for OpenMP runtime conflict
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+class DataLogger:
+    def __init__(self):
+        self.training_log = {"NonResNet": [], "SPRL": []}
+        self.eval_data = {"NonResNet": None, "SPRL": None}
 
-class Logger:
-    """
-    Handles real-time tracking of rewards and constraint violations 
-    during the 50,000 episode training run[cite: 16].
-    """
-    def __init__(self, experiment_name):
-        self.name = experiment_name
-        self.rewards = []
-        self.violations = []
-        self.avg_rewards = []
-        self.violation_rates = []
-        
-    def log_episode(self, reward, violated):
-        """Logs the total reward and safety status of a completed episode[cite: 19]."""
-        self.rewards.append(reward)
-        self.violations.append(1 if violated else 0)
-        
-        # Calculate 100-episode moving averages for smooth visualization [cite: 20]
-        window = 100
-        if len(self.rewards) >= window:
-            self.avg_rewards.append(np.mean(self.rewards[-window:]))
-            self.violation_rates.append(np.mean(self.violations[-window:]) * 100)
-        else:
-            self.avg_rewards.append(np.mean(self.rewards))
-            self.violation_rates.append(np.mean(self.violations) * 100)
+    def log_training_episode(self, agent_name, total_reward):
+        """Logs the total reward of a training episode."""
+        self.training_log[agent_name].append(total_reward)
 
-    def save_data(self):
-        """Saves training logs to CSV for later analysis[cite: 19]."""
-        df = pd.DataFrame({
-            'reward': self.rewards,
-            'violation': self.violations,
-            'avg_reward': self.avg_rewards,
-            'violation_rate': self.violation_rates
-        })
-        df.to_csv(f"{self.name}_logs.csv", index=False)
-
-def plot_training_results(loggers):
-    """
-    Generates Learning Curves (Requirement 1): 
-    Cumulative reward and violation rates vs. episode[cite: 20].
-    """
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10), sharex=True)
-    
-    for logger in loggers:
-        ax1.plot(logger.avg_rewards, label=f"{logger.name} Reward")
-        ax2.plot(logger.violation_rates, label=f"{logger.name} Violation Rate (%)")
-    
-    ax1.set_ylabel("Average Reward (100-ep window)")
-    ax1.set_title("Learning Curves: Convergence & Safety")
-    ax1.legend()
-    ax1.grid(True, alpha=0.3)
-    
-    ax2.set_ylabel("Violation Rate (%)")
-    ax2.set_xlabel("Episode")
-    ax2.legend()
-    ax2.grid(True, alpha=0.3)
-    
-    plt.tight_layout()
-    plt.savefig("training_benchmarks.png")
-    plt.show()
-
-def plot_evaluation_comparison(results):
-    """
-    Generates Comparative Histograms (Requirement 2):
-    Benchmarks ResNet vs. Non-ResNet vs. MPC on Reward and Safety[cite: 21, 23, 24].
-    'results' should be a dict: {'AgentName': {'reward': val, 'violations': val}}
-    """
-    # Attempt to load MPC baseline if not already in results
-    if os.path.exists("mpc_results.csv"):
-        mpc_df = pd.read_csv("mpc_results.csv")
-        results['MPC Oracle'] = {
-            'reward': mpc_df['reward'].iloc[0],
-            'violations': mpc_df['violations'].iloc[0]
+    def log_evaluation_trajectory(self, agent_name, states, actions, rewards, info_list):
+        """Logs a full episode trajectory for state/action plotting."""
+        # Convert lists to numpy for easier indexing
+        self.eval_data[agent_name] = {
+            "states": np.array(states),   # [T, 3]
+            "actions": np.array(actions), # [T, 2]
+            "rewards": np.array(rewards), # [T]
+            "is_safe": np.array([i["is_safe"] for i in info_list]),
+            "breakdown": pd.DataFrame([i["reward_breakdown"] for i in info_list])
         }
 
-    labels = list(results.keys())
-    rewards = [results[l]['reward'] for l in labels]
-    violations = [results[l]['violations'] for l in labels]
+class Plotter:
+    @staticmethod
+    def plot_training_results(training_log, window=50):
+        """1. Reward vs Episodes (50-episode moving average)"""
+        plt.figure(figsize=(10, 6))
+        for agent_name, rewards in training_log.items():
+            if len(rewards) < window: continue
+            
+            # Calculate Moving Average
+            mv_avg = pd.Series(rewards).rolling(window=window).mean()
+            plt.plot(mv_avg, label=f"{agent_name} (MA {window})")
+            
+            # Add semi-transparent raw data
+            plt.plot(rewards, alpha=0.15, color=plt.gca().lines[-1].get_color())
 
-    x = np.arange(len(labels))
-    width = 0.35
+        plt.title("Training Convergence: Reward vs Episodes")
+        plt.xlabel("Episodes")
+        plt.ylabel("Cumulative Reward")
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.savefig("training_comparison.png")
+        plt.show()
 
-    fig, ax1 = plt.subplots(figsize=(12, 7))
+    @staticmethod
+    def plot_evaluation_trajectories(eval_data):
+        """
+        2. Average [I, Fn] vs Time
+        3. [cx, cN, cq] vs Time
+        4. Constraint Violations
+        """
+        fig, axes = plt.subplots(3, 2, figsize=(15, 12), sharex=True)
+        time = np.arange(len(eval_data["SPRL"]["states"]))
 
-    # Reward Bar 
-    rects1 = ax1.bar(x - width/2, rewards, width, label='Avg Reward', color='#2ecc71')
-    ax1.set_ylabel('Cumulative Reward')
-    ax1.set_title('Final Evaluation Benchmarks (RL vs. MPC Oracle)')
-    ax1.set_xticks(x)
-    ax1.set_xticklabels(labels)
-    
-    # Violation Bar (Secondary Axis) 
-    ax2 = ax1.twinx()
-    rects2 = ax2.bar(x + width/2, violations, width, label='Violations', color='#e74c3c')
-    ax2.set_ylabel('Avg Violations per Episode')
-    
-    # Combined legend
-    lines, labels_lg = ax1.get_legend_handles_labels()
-    lines2, labels2 = ax2.get_legend_handles_labels()
-    ax2.legend(lines + lines2, labels_lg + labels2, loc='upper left')
+        # --- Subplot 1: States [cx, cN, cq] ---
+        for i, label in enumerate(["Biomass ($c_x$)", "Nitrate ($c_N$)", "Product ($c_q$)"]):
+            for agent in ["NonResNet", "SPRL"]:
+                axes[i//2, i%2].plot(time, eval_data[agent]["states"][:, i], label=f"{agent}")
+            axes[i//2, i%2].set_title(f"{label} over Time")
+            axes[i//2, i%2].legend()
+            axes[i//2, i%2].grid(True, alpha=0.2)
 
-    fig.tight_layout()
-    plt.savefig("evaluation_comparison.png")
-    plt.show()
+        # --- Subplot 2: Actions [I, F_N] ---
+        # Light Intensity (I)
+        for agent in ["NonResNet", "SPRL"]:
+            # Note: Actions from agent are [-1, 1], we map to physical for plotting
+            I_phys = (eval_data[agent]["actions"][:, 0] + 1) * 1500.0
+            axes[1, 1].plot(time, I_phys, label=f"{agent}")
+        axes[1, 1].set_title("Light Intensity ($I$) over Time")
+        axes[1, 1].axhline(y=450, color='r', linestyle='--', alpha=0.5, label="I_crit (Unshaded)")
+        axes[1, 1].legend()
 
-def plot_temporal_dynamics(rl_trajectories):
-    """
-    Generates Temporal Dynamics (Requirement 3):
-    Phycocyanin production vs. time comparing RL to MPC baseline.
-    'rl_trajectories' should be a dict of lists containing 'cq' over time.
-    """
-    plt.figure(figsize=(12, 6))
-    
-    # Plot RL Variants
-    for name, data in rl_trajectories.items():
-        plt.plot(data, label=name, linewidth=2, alpha=0.8)
-    
-    # Load and Plot MPC Baseline 
-    if os.path.exists("mpc_trajectory.npy"):
-        mpc_data = np.load("mpc_trajectory.npy")
-        plt.plot(mpc_data, label="MPC Oracle (Baseline)", color='black', linestyle='--', linewidth=2.5)
-    
-    plt.title("Temporal Dynamics: Phycocyanin Production (cq) Over Time")
-    plt.xlabel("Time Step (Total: 7,200 Steps)")
-    plt.ylabel("Phycocyanin Concentration (cq)")
-    plt.legend()
-    plt.grid(True, linestyle='--', alpha=0.6)
-    plt.savefig("production_dynamics.png")
-    plt.show()
+        # Nitrate Feed (Fn)
+        for agent in ["NonResNet", "SPRL"]:
+            Fn_phys = (eval_data[agent]["actions"][:, 1] + 1) * 10.0
+            axes[2, 0].plot(time, Fn_phys, label=f"{agent}")
+        axes[2, 0].set_title("Nitrate Feed ($F_N$) over Time")
+        axes[2, 0].legend()
+
+        # --- Subplot 3: Constraint Violations ---
+        for agent in ["NonResNet", "SPRL"]:
+            # 1 = Safe, 0 = Violation
+            violation_mask = eval_data[agent]["is_safe"].astype(int)
+            axes[2, 1].step(time, violation_mask, label=f"{agent}", where='post')
+        
+        axes[2, 1].set_title("Safety Integrity (1=Safe, 0=Violation)")
+        axes[2, 1].set_ylim([-0.1, 1.1])
+        axes[2, 1].legend()
+
+        plt.tight_layout()
+        plt.savefig("evaluation_trajectories.png")
+        plt.show()

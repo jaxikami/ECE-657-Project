@@ -26,14 +26,14 @@ def get_fresh_batch_dataset(num_samples=450000, device='cuda'):
     # Photoinhibition Constraint Calculation [cite: 11]
     shading_factor = torch.exp(-alpha * cx * L)
     i_limit = I_crit / (shading_factor + 1e-6)
-    i_safe = torch.minimum(i_nom, i_limit)
+    i_safe = torch.minimum(i_nom, i_limit*0.99)  # Slight buffer to ensure safety
     
     # Nitrate Toxicity Constraint [cite: 11]
     # If cN > 180, set feed to 0 to prevent toxicity [cite: 11]
     fn_limit = torch.where(cN > 180.0, 
                            torch.tensor(0.0, device=device), 
                            torch.tensor(Fn_max, device=device))
-    fn_safe = torch.minimum(fn_nom, fn_limit)
+    fn_safe = torch.minimum(fn_nom, fn_limit*0.99)  # Slight buffer to ensure safety
     
     # 5. Stack and Return Tensors 
     # Returns are already on the GPU, ready for ActionProjectionNetwork
