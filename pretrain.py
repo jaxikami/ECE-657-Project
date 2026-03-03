@@ -70,7 +70,7 @@ def run_pretraining(epochs=10000, batch_size=32768, buffer_size=2000000, refresh
 #    during the initial high-learning-rate phase.
 #
 # 2. PRECISION TARGET (early_stop_threshold): 
-#    The model must achieve an Average SmoothL1 Loss of 3e-4 or lower. 
+#    The model must achieve an Average SmoothL1 Loss of 1e-4 or lower. 
 #    This defines the mathematical "closeness" required for the projected 
 #    action to be considered safe.
 #
@@ -85,7 +85,7 @@ def run_pretraining(epochs=10000, batch_size=32768, buffer_size=2000000, refresh
 #    The model must "prove its mastery" all over again on the new data 
 #    to ensure it hasn't overfit to the previous buffer.
 
-    early_stop_threshold = 5e-4
+    early_stop_threshold = 3e-4
     required_success_per_buffer = 80
     start_monitoring_epoch = 3000
     buffer_success_count = 0
@@ -204,7 +204,7 @@ def run_pretraining(epochs=10000, batch_size=32768, buffer_size=2000000, refresh
         })
 
         if buffer_success_count >= required_success_per_buffer:
-            print(f"\n[Success] Mastery! {buffer_success_count} epochs below {early_stop_threshold} in current buffer.")
+            print(f"\n[Success] {buffer_success_count} epochs below {early_stop_threshold} in current buffer.")
             break
 
     # Save weights
