@@ -3,9 +3,9 @@ import torch
 from pcgym import make_env
 
 class PhycocyaninSafeEnv:
-    def __init__(self, render_mode=None):
+    def __init__(self):
         # Initialize the core pc-gym environment
-        self.env = make_env("photoproduction", render_mode=render_mode)
+        self.env = make_env("photoproduction")
         
         # Physical Constants
         self.I_crit = 450.0
