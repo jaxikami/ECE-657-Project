@@ -49,8 +49,8 @@ def run_pretraining(epochs=6000, batch_size=8192, buffer_size=450000, refresh_in
     a_mean, a_std = a_init.mean(0), a_init.std(0)
     
     np.savez("norm_constants.npz", 
-             s_mean=s_mean.numpy(), s_std=s_std.numpy(), 
-             a_mean=a_mean.numpy(), a_std=a_std.numpy())
+             s_mean=s_mean.cpu().numpy(), s_std=s_std.cpu().numpy(), 
+             a_mean=a_mean.cpu().numpy(), a_std=a_std.cpu().numpy())
 
     s_m, s_s = s_mean.to(device), s_std.to(device)
     a_m, a_s = a_mean.to(device), a_std.to(device)
@@ -137,9 +137,9 @@ def run_pretraining(epochs=6000, batch_size=8192, buffer_size=450000, refresh_in
             s_raw = s_raw + torch.randn_like(s_raw) * (s_raw.std(0) * noise_scale)
             a_raw = a_raw + torch.randn_like(a_raw) * (a_raw.std(0) * noise_scale)
             
-            s_norm = (s_raw.to(device) - s_m) / (s_s + 1e-8)
-            a_norm = (a_raw.to(device) - a_m) / (a_s + 1e-8)
-            y_norm = (y_target.to(device) - a_m) / (a_s + 1e-8)
+            s_norm = (s_raw - s_m) / (s_s + 1e-8)
+            a_norm = (a_raw - a_m) / (a_s + 1e-8)
+            y_norm = (y_target - a_m) / (a_s + 1e-8)
             
             train_ds = TensorDataset(s_norm, a_norm, y_norm)
             loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)

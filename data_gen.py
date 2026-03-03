@@ -1,34 +1,44 @@
-import numpy as np
 import torch
-from torch.utils.data import TensorDataset
 
-def get_fresh_batch_dataset(num_samples=20000):
+def get_fresh_batch_dataset(num_samples=450000, device='cuda'):
     """
-    Generates a fresh dataset for a single epoch to prevent overfitting.
+    GPU-accelerated dataset generation for the RX 9070 XT.
+    Generates and constrains data directly in VRAM to eliminate 
+    PCIe transport bottlenecks.
     """
-    # Physical Constants
-    I_crit, alpha, L, Fn_max = 450.0, 0.25, 0.5, 10.0
+    # 1. Physical Constants from the pc-gym environment [cite: 10, 11]
+    I_crit = 450.0  # Critical light intensity [cite: 11]
+    alpha = 0.25    # Light attenuation coefficient [cite: 11]
+    L = 0.5         # Path length [cite: 11]
+    Fn_max = 10.0   # Maximum nitrate feed rate [cite: 11]
     
-    # 1. Sample State Space
-    cx = np.random.uniform(0.05, 6.0, num_samples)
-    cN = np.random.uniform(0.0, 200.0, num_samples)
-    cq = np.random.uniform(0.0, 25.0, num_samples)
+    # 2. Sample State Space directly on GPU [cite: 14]
+    # Standardizing ranges based on environment dynamics [cite: 11]
+    cx = torch.rand(num_samples, device=device) * (6.0 - 0.05) + 0.05  # Biomass
+    cN = torch.rand(num_samples, device=device) * 200.0                # Nitrate
+    cq = torch.rand(num_samples, device=device) * 25.0                 # Phycocyanin
     
-    # 2. Sample Nominal Actions
-    i_nom = np.random.uniform(0, 3000, num_samples)
-    fn_nom = np.random.uniform(0, 20, num_samples)
+    # 3. Sample Nominal "Unsafe" Actions [cite: 13]
+    i_nom = torch.rand(num_samples, device=device) * 3000.0  # Light intensity
+    fn_nom = torch.rand(num_samples, device=device) * 20.0   # Feed rate
     
-    # 3. Apply Hard Constraints
-    shading_factor = np.exp(-alpha * cx * L)
+    # 4. Vectorized Safety Projection (The Target Manifold) 
+    # Photoinhibition Constraint Calculation [cite: 11]
+    shading_factor = torch.exp(-alpha * cx * L)
     i_limit = I_crit / (shading_factor + 1e-6)
-    i_safe = np.minimum(i_nom, i_limit)
+    i_safe = torch.minimum(i_nom, i_limit)
     
-    fn_limit = np.where(cN > 180.0, 0.0, Fn_max)
-    fn_safe = np.minimum(fn_nom, fn_limit)
+    # Nitrate Toxicity Constraint [cite: 11]
+    # If cN > 180, set feed to 0 to prevent toxicity [cite: 11]
+    fn_limit = torch.where(cN > 180.0, 
+                           torch.tensor(0.0, device=device), 
+                           torch.tensor(Fn_max, device=device))
+    fn_safe = torch.minimum(fn_nom, fn_limit)
     
-    # 4. Convert to Tensors
-    states = torch.tensor(np.stack([cx, cN, cq], axis=1), dtype=torch.float32)
-    nom_actions = torch.tensor(np.stack([i_nom, fn_nom], axis=1), dtype=torch.float32)
-    target_actions = torch.tensor(np.stack([i_safe, fn_safe], axis=1), dtype=torch.float32)
+    # 5. Stack and Return Tensors 
+    # Returns are already on the GPU, ready for ActionProjectionNetwork
+    states = torch.stack([cx, cN, cq], dim=1)
+    nom_actions = torch.stack([i_nom, fn_nom], dim=1)
+    target_actions = torch.stack([i_safe, fn_safe], dim=1)
     
     return states, nom_actions, target_actions
