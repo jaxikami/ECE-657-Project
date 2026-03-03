@@ -30,10 +30,10 @@ def get_fresh_batch_dataset(num_samples=450000, device='cuda'):
     
     # Nitrate Toxicity Constraint [cite: 11]
     # If cN > 180, set feed to 0 to prevent toxicity [cite: 11]
-    fn_limit = torch.where(cN > 180.0, 
+    fn_limit = torch.where(cN > 180.0*0.99, 
                            torch.tensor(0.0, device=device), 
                            torch.tensor(Fn_max, device=device))
-    fn_safe = torch.minimum(fn_nom, fn_limit*0.99)  # Slight buffer to ensure safety
+    fn_safe = torch.minimum(fn_nom, fn_limit)  # Slight buffer to ensure safety
     
     # 5. Stack and Return Tensors 
     # Returns are already on the GPU, ready for ActionProjectionNetwork
