@@ -115,7 +115,7 @@ class SPRL_Agent:
             self.a_std = torch.tensor(norms['a_std'], dtype=torch.float32).to(device)
 
         # High-precision loss for the mapping penalty
-        self.criterion = nn.SmoothL1Loss(beta=0.01)
+        self.criterion = nn.SmoothL1Loss(beta=0.005)
         self.return_rms = RunningMeanStd(shape=())
 
     def select_action(self, state):

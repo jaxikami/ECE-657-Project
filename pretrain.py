@@ -35,7 +35,7 @@ class ActionProjectionNetwork(nn.Module):
         # Safe Action = Intent - Reduction
         return nom_act_norm - delta
 
-def run_pretraining(epochs=40000, batch_size=65536, buffer_size=2000000, refresh_interval=100):
+def run_pretraining(epochs=10000, batch_size=65536, buffer_size=2000000, refresh_interval=100):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = ActionProjectionNetwork().to(device)
     a_mean = torch.tensor([0.0, 0.0], device=device)
@@ -50,15 +50,16 @@ def run_pretraining(epochs=40000, batch_size=65536, buffer_size=2000000, refresh
     eta_min=1e-5
 )
     # decay_end_epoch = epochs
-    criterion = nn.SmoothL1Loss(beta=0.01)
+
     history = []
+    unbiased_history = []
     lr_history = []
     ma_window = 500  # The window for the moving average
     check_duration = 1000     # How many epochs to monitor for lack of change
     min_relative_change = 0.001  # 0.1% threshold
     stagnation_counter = 0
     best_ma_value = None
-    relative_change = 0
+
     # Early Stopping Logic
 # 1. LATENCY PERIOD (start_monitoring_epoch): 
 #    We wait 3,000 epochs before checking for success. This prevents the 
@@ -81,9 +82,9 @@ def run_pretraining(epochs=40000, batch_size=65536, buffer_size=2000000, refresh
 #    The model must "prove its mastery" all over again on the new data 
 #    to ensure it hasn't overfit to the previous buffer.
 
-    early_stop_threshold = 1.5e-3
-    required_success_per_buffer = 90
-    start_monitoring_epoch = 2000
+    early_stop_threshold = 3e-4
+    required_success_per_buffer = 80
+    start_monitoring_epoch = 3000
     buffer_success_count = 0
     
     pbar = tqdm(range(epochs), desc="Training Safety Manifold")
@@ -162,6 +163,7 @@ def run_pretraining(epochs=40000, batch_size=65536, buffer_size=2000000, refresh
         # Training Execution
         model.train()
         epoch_loss = 0
+        unbiased_epoch_loss = 0
         indices = torch.randperm(buffer_size, device=device)
         
         # 2. Iterate through the buffer using direct VRAM slicing 
@@ -183,15 +185,17 @@ def run_pretraining(epochs=40000, batch_size=65536, buffer_size=2000000, refresh
                 # Positive error means safe_action_predicted > safe_action_target (UNSAFE)
                 error = pred_y - b_y
                 
-                # Penalize violations 20x more than over-throttling
-                asymmetric_sq_error = torch.where(error > 0, 20.0 * (error**2), error**2)
+                # Penalize violations 10x more than over-throttling
+                asymmetric_sq_error = torch.where(error > 0, 10 * (error**2), error**2)
                 
                 # Identification of correction samples for weighted focus
                 is_corrected = torch.any(torch.abs(b_a - b_y) > 1e-5, dim=1).float()
                 weights = 1.0 + (is_corrected * 5.0)
                 
                 loss = (asymmetric_sq_error * weights.unsqueeze(1)).mean()
-
+                with torch.no_grad():
+                    unbiased_mse = torch.mean((pred_y - b_y)**2)
+                    
             # High-throughput backprop
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -200,9 +204,12 @@ def run_pretraining(epochs=40000, batch_size=65536, buffer_size=2000000, refresh
             scaler.update()
             
             epoch_loss += loss.item()
+            unbiased_epoch_loss += unbiased_mse.item()
             
         avg_loss = epoch_loss / (buffer_size / batch_size)
+        avg_unbiased = unbiased_epoch_loss / (buffer_size / batch_size)
         history.append(avg_loss)
+        unbiased_history.append(avg_unbiased)
         scheduler.step()
         current_lr = scheduler.get_last_lr()[0]
         lr_history.append(current_lr)
@@ -210,12 +217,12 @@ def run_pretraining(epochs=40000, batch_size=65536, buffer_size=2000000, refresh
         # --- Per-Buffer Early Exit Logic ---
         if epoch >= start_monitoring_epoch:
             # 1. Check for Precision Success (The target goal)
-            if avg_loss < early_stop_threshold:
+            if avg_unbiased < early_stop_threshold:
                 buffer_success_count += 1
             
             # 2. Check for Stagnation (The "Give Up" logic)
-            if len(history) >= ma_window:
-                current_ma = np.mean(history[-ma_window:])
+            if len(unbiased_history) >= ma_window:
+                current_ma = np.mean(unbiased_history[-ma_window:])
                 
                 if best_ma_value is None:
                     best_ma_value = current_ma
@@ -245,6 +252,7 @@ def run_pretraining(epochs=40000, batch_size=65536, buffer_size=2000000, refresh
 
         pbar.set_postfix({
             'Loss': f'{avg_loss:.2e}', 
+            'unbiased': f'{avg_unbiased:.2e}',
             'BufSuccess': f"{buffer_success_count}/{required_success_per_buffer}",
             'Age': buffer_age
         })
@@ -271,17 +279,17 @@ def run_pretraining(epochs=40000, batch_size=65536, buffer_size=2000000, refresh
 
     # Calculate Moving Average (200 episodes)
     window = 200
-    if len(history) >= window:
-        moving_avg = np.convolve(history, np.ones(window)/window, mode='valid')
+    if len(unbiased_history) >= window:
+        moving_avg = np.convolve(unbiased_history, np.ones(window)/window, mode='valid')
         # Pad with NaNs so the moving average line aligns with the history index
         moving_avg_padded = np.concatenate([np.full(window-1, np.nan), moving_avg])
     else:
-        moving_avg_padded = np.full(len(history), np.nan)
+        moving_avg_padded = np.full(len(unbiased_history), np.nan)
 
     # 1. Raw Training Loss
     ax1.set_xlabel('Epochs')
     ax1.set_ylabel('SmoothL1 Loss')
-    ax1.plot(history, color='#2c3e50', alpha=0.3, linewidth=1, label='Raw Epoch Loss')
+    ax1.plot(unbiased_history, color='#2c3e50', alpha=0.3, linewidth=1, label='Raw Epoch Loss')
     
     # 2. Moving Average
     ax1.plot(moving_avg_padded, color='#e74c3c', linewidth=2, label=f'{window}-Epoch Moving Average')
