@@ -24,7 +24,6 @@ def run_synchronized_stress_test(num_test_samples=5000):
     # Constants from env.py / data_gen.py
     I_MAX, FN_MAX = 3000.0, 20.0
     I_CRIT, ALPHA, L = 450.0, 0.25, 0.5
-    N_LIMIT = 175.0
     N_LIMIT_BUFFER = 180 * 0.95
     # Helper to calculate the 4th feature (Budget Distance)
     def get_4d_state(cx, cN, cq):
@@ -60,7 +59,7 @@ def run_synchronized_stress_test(num_test_samples=5000):
     # --- TEST B: NITROGEN BUDGET (N) ---
     print(f"\n--- [TEST B] Nitrogen Budget Stress Test ({num_test_samples} samples) ---")
     cx_safe = torch.full((num_test_samples,), 1.0, device=device) 
-    cN_test = torch.linspace(150.0, 170.0, num_test_samples, device=device)
+    cN_test = torch.linspace(160.0, 170.0, num_test_samples, device=device)
     
     # Generate 4D state for Test B
     states_n_4d = get_4d_state(cx_safe, cN_test, cq_rand)
@@ -75,7 +74,7 @@ def run_synchronized_stress_test(num_test_samples=5000):
         fn_phys = ((u_safe_n[i, 1] + 1.0) / 2.0) * FN_MAX
         
         # Predicted next state must be below 95% threshold
-        if (current_cN + fn_phys) > (N_LIMIT + 1e-3):
+        if (current_cN + fn_phys) > (N_LIMIT_BUFFER + 1e-3):
             n_violations += 1
 
     print(f"Result: {n_violations} Nitrogen violations (Fail Rate: {(n_violations/num_test_samples)*100:.2f}%)")

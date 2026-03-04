@@ -83,7 +83,7 @@ def run_pretraining(epochs=40000, batch_size=65536, buffer_size=2000000, refresh
 
     early_stop_threshold = 3e-4
     required_success_per_buffer = 80
-    start_monitoring_epoch = 3000
+    start_monitoring_epoch = 2000
     buffer_success_count = 0
     
     pbar = tqdm(range(epochs), desc="Training Safety Manifold")
