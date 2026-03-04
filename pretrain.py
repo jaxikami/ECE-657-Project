@@ -81,8 +81,8 @@ def run_pretraining(epochs=40000, batch_size=65536, buffer_size=2000000, refresh
 #    The model must "prove its mastery" all over again on the new data 
 #    to ensure it hasn't overfit to the previous buffer.
 
-    early_stop_threshold = 3e-4
-    required_success_per_buffer = 80
+    early_stop_threshold = 1.5e-3
+    required_success_per_buffer = 90
     start_monitoring_epoch = 2000
     buffer_success_count = 0
     
