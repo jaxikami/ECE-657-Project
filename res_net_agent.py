@@ -47,7 +47,7 @@ class ActorCritic(nn.Module):
         
         # Mean of the latent intent (z)
         self.actor_latent_mean = nn.Linear(128, latent_dim) 
-        self.log_std = nn.Parameter(torch.zeros(latent_dim))
+        self.log_std = nn.Parameter(torch.ones(latent_dim) * -1.0)
 
         # Critic: Estimating Value [cite: 156]
         self.critic = nn.Sequential(
@@ -175,18 +175,23 @@ class SPRL_Agent:
             # --- SP-RL MAPPING PENALTY (Regularization) [cite: 78, 427] ---
             # Penalize distance between intent and safe projection to prevent zero-gradients.
             with torch.no_grad():
+                # 1. Normalize current state and sampled intent
                 s_n = (old_states - self.s_mean) / (self.s_std + 1e-8)
                 z_n = (old_latents - self.a_mean) / (self.a_std + 1e-8)
+                
+                # 2. Get the safe projection from the safeguard
                 u_safe_n = self.safeguard(s_n, z_n)
                 u_safe = (u_safe_n * (self.a_std + 1e-8)) + self.a_mean
-            
-            mapping_penalty = self.criterion(old_latents, u_safe).mean() * 2
+            diff = old_latents - u_safe
+            mask = (torch.abs(diff) > 1e-3).float()
+            mapping_penalty = (self.criterion(old_latents, u_safe) * mask).mean()
             value_loss = 0.5 * self.criterion(state_values.squeeze(), scaled_rewards)
+            mapping_penalty_coeff = 0.1  # Hyperparameter to balance the penalty
             # Combined Loss [cite: 411, 427]
             loss = -torch.min(surr1, surr2) + \
                 value_loss - \
                 self.entropy_coeff * dist_entropy + \
-                0.05 * mapping_penalty  # <--- SP-RL Action Aliasing Penalty
+                mapping_penalty_coeff * mapping_penalty  # <--- SP-RL Action Aliasing Penalty
 
             self.optimizer.zero_grad()
             loss.mean().backward()
