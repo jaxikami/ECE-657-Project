@@ -177,8 +177,8 @@ if __name__ == "__main__":
     lag_agent = NonResNet_Agent(STATE_DIM, ACTION_DIM, LR_ACTOR, LR_CRITIC, GAMMA, K_EPOCHS, EPS_CLIP)
     sprl_agent = SPRL_Agent(STATE_DIM, ACTION_DIM, LR_ACTOR, LR_CRITIC, GAMMA, K_EPOCHS, EPS_CLIP, ENTROPY_COEFF, LATENT_DIM)
     
-    train_agent("NonResNet", lag_agent, logger)
     train_agent("SPRL", sprl_agent, logger)
+    train_agent("NonResNet", lag_agent, logger)
     
     evaluate_agent("NonResNet", lag_agent, logger)
     evaluate_agent("SPRL", sprl_agent, logger)

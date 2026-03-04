@@ -63,20 +63,27 @@ class ActorCritic(nn.Module):
         std = torch.exp(torch.clamp(self.log_std, self.LOG_STD_MIN, self.LOG_STD_MAX))
         dist = Normal(mean, std)
         
-        z = dist.sample()
-        log_prob = dist.log_prob(z).sum(dim=-1)
+        z_raw = dist.sample()
+        z = torch.tanh(z_raw)
+        log_prob = dist.log_prob(z_raw).sum(dim=-1)
         return z.detach(), log_prob.detach()
 
     def evaluate(self, state, z_sampled):
-        """Evaluates latents for PPO update[cite: 178]."""
+        """Evaluates latents with matching squashing logic."""
         base_output = self.actor_base(state)
         mean = self.actor_latent_mean(base_output)
+        
+        # We use tanh on the mean to help the network converge towards 
+        # the [-1, 1] range the safeguard expects.
+        mean = torch.tanh(mean) 
+        
         std = torch.exp(torch.clamp(self.log_std, self.LOG_STD_MIN, self.LOG_STD_MAX))
         dist = Normal(mean, std)
         
         log_probs = dist.log_prob(z_sampled).sum(dim=-1)
         dist_entropy = dist.entropy().sum(dim=-1)
         state_values = self.critic(state)
+        
         return log_probs, state_values, dist_entropy
 
 class SPRL_Agent:

@@ -81,7 +81,7 @@ class PhotoProductionEnv:
         """Executes one step with noise injection and detailed info logging."""
         # 1. Action Processing with Conditional Noise
         processed_action = action.copy()
-        if self.train_mode:
+        if not self.train_mode:
             noise = np.random.normal(0, self.noise_std, size=self.actionDim)
             processed_action += noise
         
@@ -120,7 +120,7 @@ class PhotoProductionEnv:
             penalty_safety = -(1.0 + i_penalty + n_penalty)/5 
         else:
             penalty_safety = 0.0
-        penalty_smoothing = -0.3 * np.mean(np.square(a_clipped - self.prev_action))
+        penalty_smoothing = -0.2 * np.mean(np.square(a_clipped - self.prev_action))
         penalty_biomass = -0.05 * self.state[0]
         
         total_reward = reward_prod + penalty_safety + penalty_smoothing + penalty_biomass
