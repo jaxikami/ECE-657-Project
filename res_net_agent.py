@@ -121,7 +121,7 @@ class SPRL_Agent:
             self.a_mean = torch.tensor(norms['a_mean'], dtype=torch.float32).to(device)
             self.a_std = torch.tensor(norms['a_std'], dtype=torch.float32).to(device)
 
-        self.MseLoss = nn.MSELoss()
+        self.criterion = nn.SmoothL1Loss(beta=0.1)
         self.return_rms = RunningMeanStd(shape=())
 
     def select_action(self, state):
@@ -180,13 +180,13 @@ class SPRL_Agent:
                 u_safe_n = self.safeguard(s_n, z_n)
                 u_safe = (u_safe_n * (self.a_std + 1e-8)) + self.a_mean
             
-            mapping_penalty = torch.mean((old_latents - u_safe)**2)*2
-
+            mapping_penalty = self.criterion(old_latents, u_safe).mean() * 2
+            value_loss = 0.5 * self.criterion(state_values.squeeze(), scaled_rewards)
             # Combined Loss [cite: 411, 427]
             loss = -torch.min(surr1, surr2) + \
-                   0.5 * self.MseLoss(state_values.squeeze(), scaled_rewards) - \
-                   self.entropy_coeff * dist_entropy + \
-                   0.5 * mapping_penalty  # <--- SP-RL Remedy [cite: 78]
+                value_loss - \
+                self.entropy_coeff * dist_entropy + \
+                0.05 * mapping_penalty  # <--- SP-RL Action Aliasing Penalty
 
             self.optimizer.zero_grad()
             loss.mean().backward()
