@@ -19,16 +19,24 @@ def get_fresh_batch_dataset(num_samples=450000, bias=0.5, device='cuda'):
     cx = torch.cat([cx_uniform, cx_high])
 
     # --- BIAS FOR NITRATE (cN) ---
-    cN_uniform = torch.rand(n_low, device=device) * 200.0
-    cN_boundary = 160.0 + torch.rand(n_high, device=device) * 40.0
+    # 1. Uniformly sample across the new 0-170 range
+    cN_uniform = torch.rand(n_low, device=device) * 170.0
+    
+    # 2. Focus high-bias samples on the top edge (150-170)
+    # This ensures the model sees many cases where a small action triggers a violation
+    cN_boundary = 150.0 + torch.rand(n_high, device=device) * 20.0
+    
     cN = torch.cat([cN_uniform, cN_boundary])
     
     cq = torch.rand(num_samples, device=device) * 25.0
     
-    # 3. Sample Actions in the Agent's Space [-1, 1]
-    a_nom_uniform = torch.rand(n_low, 2, device=device) * 2.0 - 1.0
-    a_nom_high = 0.5 + torch.rand(n_high, 2, device=device) * 0.5
-    a_nom = torch.cat([a_nom_uniform, a_nom_high])
+    # 3. Sample Actions: Force "Dangerous" Intent
+    a_nom_low = torch.rand(n_low, 2, device=device) * 2.0 - 1.0
+    
+    # CRITICAL CHANGE: In the high-bias group, we force actions to be high (0.5 to 0.9).
+    # Since cN is already high here, high fn_phys will trigger the Nitrogen budget.
+    a_nom_high = 0.5 + torch.rand(n_high, 2, device=device) * 0.4 
+    a_nom = torch.cat([a_nom_low, a_nom_high])
     
     # 4. Denormalize Actions to Physical Units
     a_scaled = (a_nom + 1.0) / 2.0
@@ -41,20 +49,13 @@ def get_fresh_batch_dataset(num_samples=450000, bias=0.5, device='cuda'):
     i_limit = I_CRIT / (shading + 1e-6)
     i_safe_phys = torch.minimum(i_phys, i_limit * 0.95)
     
-    # --- Updated Nitrogen Constraint: Preventative Budgeting ---
-    # We calculate the remaining capacity before hitting 95% of the limit.
-    # Logic: Safe_FN = min(Requested_FN, (N_Limit * 0.95) - Current_N)
+    # --- Nitrogen Constraint: Preventative Budgeting ---
     n_buffer_target = N_LIMIT * 0.95
     fn_budget = torch.clamp(n_buffer_target - cN, min=0.0)
     fn_safe_phys = torch.minimum(fn_phys, fn_budget)
-    # 1. Define the Nitrogen Budget Target
 
-    # Calculate the "Distance to Wall"
-    # We use ReLU to ensure the distance is 0 if we are already over the limit.
+    # Calculate the "Distance to Wall" for the 4th state feature
     n_distance = torch.relu(n_buffer_target - cN)
-
-    # Scale the distance feature
-    # Normalizing by n_buffer_target keeps the value between [0, 1].
     n_distance_norm = n_distance / n_buffer_target
 
     # 6. Re-normalize Safe Physical Actions back to [-1, 1]

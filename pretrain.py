@@ -54,7 +54,7 @@ def run_pretraining(epochs=40000, batch_size=65536, buffer_size=2000000, refresh
     history = []
     lr_history = []
     ma_window = 500  # The window for the moving average
-    check_duration = 100     # How many epochs to monitor for lack of change
+    check_duration = 1000     # How many epochs to monitor for lack of change
     min_relative_change = 0.001  # 0.1% threshold
     stagnation_counter = 0
     best_ma_value = None
@@ -188,7 +188,7 @@ def run_pretraining(epochs=40000, batch_size=65536, buffer_size=2000000, refresh
                 
                 # Identification of correction samples for weighted focus
                 is_corrected = torch.any(torch.abs(b_a - b_y) > 1e-5, dim=1).float()
-                weights = 1.0 + (is_corrected * 9.0)
+                weights = 1.0 + (is_corrected * 5.0)
                 
                 loss = (asymmetric_sq_error * weights.unsqueeze(1)).mean()
 
@@ -209,19 +209,28 @@ def run_pretraining(epochs=40000, batch_size=65536, buffer_size=2000000, refresh
 
         # --- Per-Buffer Early Exit Logic ---
         if epoch >= start_monitoring_epoch:
+            # 1. Check for Precision Success (The target goal)
             if avg_loss < early_stop_threshold:
                 buffer_success_count += 1
+            
+            # 2. Check for Stagnation (The "Give Up" logic)
             if len(history) >= ma_window:
                 current_ma = np.mean(history[-ma_window:])
-                if best_ma_value is not None:
-                    relative_change = abs(current_ma - best_ma_value) / (best_ma_value + 1e-8)
+                
+                if best_ma_value is None:
+                    best_ma_value = current_ma
                 else:
-                    best_ma_value = current_ma  # Initialize on the first calculation
-                    if relative_change < min_relative_change:
-                        stagnation_counter += 1
-                    else:
-                        stagnation_counter = 0
+                    # Calculate how much we improved relative to our best recorded loss
+                    # Improvement is positive if current_ma < best_ma_value
+                    improvement = (best_ma_value - current_ma) / (best_ma_value + 1e-8)
+                    
+                    if improvement > min_relative_change:
+                        # We found a significantly better loss! Reset and update best.
                         best_ma_value = current_ma
+                        stagnation_counter = 0
+                    else:
+                        # We are either vibrating, increasing, or improving too slowly
+                        stagnation_counter += 1
         if stagnation_counter >= check_duration:
                 print(f"\n⚠️ WARNING: Training concluded early due to STAGNATION.")
                 print(f"Loss MA changed by less than {min_relative_change*100}% for {check_duration} epochs.")
