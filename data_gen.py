@@ -47,13 +47,22 @@ def get_fresh_batch_dataset(num_samples=450000, bias=0.5, device='cuda'):
     n_buffer_target = N_LIMIT * 0.95
     fn_budget = torch.clamp(n_buffer_target - cN, min=0.0)
     fn_safe_phys = torch.minimum(fn_phys, fn_budget)
+    # 1. Define the Nitrogen Budget Target
+
+    # Calculate the "Distance to Wall"
+    # We use ReLU to ensure the distance is 0 if we are already over the limit.
+    n_distance = torch.relu(n_buffer_target - cN)
+
+    # Scale the distance feature
+    # Normalizing by n_buffer_target keeps the value between [0, 1].
+    n_distance_norm = n_distance / n_buffer_target
 
     # 6. Re-normalize Safe Physical Actions back to [-1, 1]
     i_safe_norm = (i_safe_phys / I_MAX) * 2.0 - 1.0
     fn_safe_norm = (fn_safe_phys / FN_MAX) * 2.0 - 1.0
     
     # 7. Stack Outputs
-    states = torch.stack([cx, cN, cq], dim=1)
+    states = torch.stack([cx, cN, cq, n_distance_norm], dim=1)
     nom_actions = a_nom
     target_actions = torch.stack([i_safe_norm, fn_safe_norm], dim=1)
     

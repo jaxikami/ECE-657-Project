@@ -4,52 +4,52 @@ from torch.distributions import Normal
 import numpy as np
 import os
 
-# Hardware acceleration setup [cite: 14]
+# Hardware acceleration setup
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 class ActionProjectionNetwork(nn.Module):
-    def __init__(self, state_dim=3, action_dim=2, latent_dim=512):
+    """
+    Residual Safeguard: Predicts the 'reduction' (delta) to be subtracted from intent.
+    Uses a 4-dim state including the Nitrogen Budget Distance.
+    """
+    def __init__(self, state_dim=4, action_dim=2, latent_dim=512): 
         super(ActionProjectionNetwork, self).__init__()
         self.net = nn.Sequential(
             nn.Linear(state_dim + action_dim, latent_dim),
             nn.LayerNorm(latent_dim),
-            nn.ELU(), # Match pretrain.py
+            nn.ELU(),
             nn.Linear(latent_dim, latent_dim),
             nn.LayerNorm(latent_dim),
-            nn.ELU(), # Match pretrain.py
-            nn.Linear(latent_dim, latent_dim // 2),
-            nn.ELU(), # Match pretrain.py
-            nn.Linear(latent_dim // 2, action_dim) 
+            nn.ELU(),
+            nn.Linear(latent_dim, action_dim) 
         )
 
     def forward(self, state_norm, nom_act_norm):
+        # Match the Residual Delta logic: Safe = Intent - ReLU(Delta)
         x = torch.cat([state_norm, nom_act_norm], dim=1)
-        delta_norm = self.net(x)
-        return nom_act_norm + delta_norm
+        delta = torch.relu(self.net(x)) 
+        return nom_act_norm - delta
 
 class ActorCritic(nn.Module):
     """
-    SP-RL Actor-Critic: Learns the latent intent 'z' which is then 
-    passed through the safeguard[cite: 15, 59].
+    Standard PPO Actor-Critic: Learns the latent intent 'z'.
+    Uses the 3-dim physical state from the environment.
     """
-    def __init__(self, state_dim, action_dim, latent_dim):
+    def __init__(self, state_dim=3, action_dim=2, latent_dim=2):
         super(ActorCritic, self).__init__()
         self.latent_dim = latent_dim
         self.LOG_STD_MIN = -4.0
         self.LOG_STD_MAX = 0.0
 
-        # Actor Base: Shared features [cite: 14]
         self.actor_base = nn.Sequential(
             nn.Linear(state_dim, 256), nn.ReLU(),
             nn.Linear(256, 256), nn.ReLU(),
             nn.Linear(256, 128), nn.ReLU()
         )
         
-        # Mean of the latent intent (z)
         self.actor_latent_mean = nn.Linear(128, latent_dim) 
         self.log_std = nn.Parameter(torch.ones(latent_dim) * -1.0)
 
-        # Critic: Estimating Value [cite: 156]
         self.critic = nn.Sequential(
             nn.Linear(state_dim, 256), nn.ReLU(),
             nn.Linear(256, 256), nn.ReLU(),
@@ -57,7 +57,6 @@ class ActorCritic(nn.Module):
         )
 
     def act(self, state):
-        """Generates latent intent z[cite: 15]."""
         base_output = self.actor_base(state)
         mean = self.actor_latent_mean(base_output)
         std = torch.exp(torch.clamp(self.log_std, self.LOG_STD_MIN, self.LOG_STD_MAX))
@@ -69,14 +68,8 @@ class ActorCritic(nn.Module):
         return z.detach(), log_prob.detach()
 
     def evaluate(self, state, z_sampled):
-        """Evaluates latents with matching squashing logic."""
         base_output = self.actor_base(state)
-        mean = self.actor_latent_mean(base_output)
-        
-        # We use tanh on the mean to help the network converge towards 
-        # the [-1, 1] range the safeguard expects.
-        mean = torch.tanh(mean) 
-        
+        mean = torch.tanh(self.actor_latent_mean(base_output)) 
         std = torch.exp(torch.clamp(self.log_std, self.LOG_STD_MIN, self.LOG_STD_MAX))
         dist = Normal(mean, std)
         
@@ -94,7 +87,7 @@ class SPRL_Agent:
         self.entropy_coeff = entropy_coeff 
         self.latent_dim = latent_dim
 
-        # 1. Initialize Primary Policy (Predicts Z) [cite: 15]
+        # 1. Actor-Critic (Uses 3-dim physical state)
         self.policy = ActorCritic(state_dim, action_dim, latent_dim).to(device)
         self.optimizer = torch.optim.Adam([
             {'params': self.policy.actor_base.parameters(), 'lr': lr_actor},
@@ -106,14 +99,14 @@ class SPRL_Agent:
         self.policy_old = ActorCritic(state_dim, action_dim, latent_dim).to(device)
         self.policy_old.load_state_dict(self.policy.state_dict())
         
-        # 2. Load the Safeguard (Action Projection Network) [cite: 12, 59]
-        self.safeguard = ActionProjectionNetwork(state_dim, action_dim).to(device)
+        # 2. Safeguard (Uses 4-dim state: 3 phys + 1 budget distance)
+        self.safeguard = ActionProjectionNetwork(state_dim + 1, action_dim).to(device)
         if os.path.exists("action_projection_network.pth"):
             self.safeguard.load_state_dict(torch.load("action_projection_network.pth", map_location=device))
             self.safeguard.eval()
-            print("Successfully loaded Action Projection Safeguard.")
+            print("Successfully loaded Residual Budget-Aware Safeguard.")
         
-        # Load normalization constants [cite: 12]
+        # Load normalization constants
         if os.path.exists("norm_constants.npz"):
             norms = np.load("norm_constants.npz")
             self.s_mean = torch.tensor(norms['s_mean'], dtype=torch.float32).to(device)
@@ -121,40 +114,39 @@ class SPRL_Agent:
             self.a_mean = torch.tensor(norms['a_mean'], dtype=torch.float32).to(device)
             self.a_std = torch.tensor(norms['a_std'], dtype=torch.float32).to(device)
 
-        self.criterion = nn.SmoothL1Loss(beta=0.05)
+        # High-precision loss for the mapping penalty
+        self.criterion = nn.SmoothL1Loss(beta=0.01)
         self.return_rms = RunningMeanStd(shape=())
 
     def select_action(self, state):
-        """SP-RL: Agent picks intent z, Safeguard projects to safe action u_phi."""
         with torch.no_grad():
-            # 'state' comes from the environment as normalized [0, 1] via get_state_norm()
-            # But the safeguard was trained on physical units normalized by s_m_local
-            
-            # 1. Convert the env's [0, 1] state back to physical units first
-            # The env scales are [6.0, 200.0, 25.0]
+            # 1. Physical Conversion
             state_phys = state * np.array([6.0, 200.0, 25.0])
-            state_t = torch.FloatTensor(state_phys).to(device)
+            cN = state_phys[1]
             
-            # 2. Agent generates latent intent 'z' (the raw desire)
-            z, log_prob = self.policy_old.act(state_t)
+            # 2. Budget Distance Calculation
+            n_limit_phys = 180.0 * 0.95
+            n_dist = max(0.0, n_limit_phys - cN) / n_limit_phys
             
-            # 3. Normalize for the safeguard using the FINAL LOCAL STATS
-            s_norm = (state_t.unsqueeze(0) - self.s_mean) / (self.s_std + 1e-8)
+            # 3. Form 4D state for Safeguard and 3D for Actor
+            state_4d = np.append(state_phys, n_dist)
+            state_t_4d = torch.FloatTensor(state_4d).to(device)
+            state_t_3d = torch.FloatTensor(state_phys).to(device)
             
-            # Actions/Intents are usually [-1, 1], so a_mean=0, a_std=1
+            # 4. Generate Latent Intent 'z'
+            z, log_prob = self.policy_old.act(state_t_3d)
+            
+            # 5. Safeguard Projection
+            s_norm = (state_t_4d.unsqueeze(0) - self.s_mean) / (self.s_std + 1e-8)
             z_norm = (z.unsqueeze(0) - self.a_mean) / (self.a_std + 1e-8)
-            
-            # 4. Project to safe manifold
             u_phi_norm = self.safeguard(s_norm, z_norm)
             
-            # 5. Denormalize back to [-1, 1] for the environment
+            # 6. Physical Renormalization
             u_phi = (u_phi_norm * (self.a_std + 1e-8)) + self.a_mean
             
         return u_phi.cpu().numpy().flatten(), z.cpu().numpy(), log_prob.cpu().numpy()
 
     def learn(self, memory):
-        """PPO update with SP-RL Mapping Penalty[cite: 47, 78]."""
-        # Standard reward discounting and normalization [cite: 180, 182]
         rewards = []
         discounted_reward = 0
         for reward, is_terminal in zip(reversed(memory.rewards), reversed(memory.is_terminals)):
@@ -166,44 +158,52 @@ class SPRL_Agent:
         self.return_rms.update(rewards_tensor.cpu().numpy())
         scaled_rewards = rewards_tensor / (np.sqrt(self.return_rms.var) + 1e-8)
 
-        old_states = torch.squeeze(torch.stack(memory.states, dim=0)).detach().to(device)
+        # Agent states are [0, 1] normalized from env; convert to physical for mapping penalty
+        states_norm = torch.squeeze(torch.stack(memory.states, dim=0)).detach().to(device)
+        old_states_phys = states_norm * torch.tensor([6.0, 200.0, 25.0], device=device)
+        
         old_latents = torch.squeeze(torch.stack(memory.actions, dim=0)).detach().to(device)
         old_logprobs = torch.squeeze(torch.stack(memory.logprobs, dim=0)).detach().to(device)
 
-        # Optimize policy
         for _ in range(self.K_epochs):
-            logprobs, state_values, dist_entropy = self.policy.evaluate(old_states, old_latents)
+            # Actor uses the 3-dim physical state
+            logprobs, state_values, dist_entropy = self.policy.evaluate(old_states_phys, old_latents)
             
-            # PPO Ratio [cite: 15]
             ratios = torch.exp(logprobs - old_logprobs)
-            
-            # Advantages [cite: 178]
             advantages = scaled_rewards - state_values.detach().squeeze()
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
             surr1 = ratios * advantages
             surr2 = torch.clamp(ratios, 1 - self.eps_clip, 1 + self.eps_clip) * advantages
 
-            # --- SP-RL MAPPING PENALTY (Regularization) [cite: 78, 427] ---
-            # Penalize distance between intent and safe projection to prevent zero-gradients.
+            # --- SP-RL MAPPING PENALTY ---
             with torch.no_grad():
-                # 1. Normalize current state and sampled intent
-                s_n = (old_states - self.s_mean) / (self.s_std + 1e-8)
-                z_n = (old_latents - self.a_mean) / (self.a_std + 1e-8)
+                # 1. Re-calculate Budget Distance for batch
+                cN_batch = old_states_phys[:, 1]
+                n_limit_phys = 180.0 * 0.95
+                n_dist_batch = torch.clamp(n_limit_phys - cN_batch, min=0.0) / n_limit_phys
                 
-                # 2. Get the safe projection from the safeguard
+                # 2. Re-stack to 4D for the safeguard
+                old_states_4d = torch.cat([old_states_phys, n_dist_batch.unsqueeze(1)], dim=1)
+                
+                # 3. Projection
+                s_n = (old_states_4d - self.s_mean) / (self.s_std + 1e-8)
+                z_n = (old_latents - self.a_mean) / (self.a_std + 1e-8)
                 u_safe_n = self.safeguard(s_n, z_n)
                 u_safe = (u_safe_n * (self.a_std + 1e-8)) + self.a_mean
+
+            # Penalty applies if safeguard throttles production
             diff = old_latents - u_safe
-            mask = (torch.abs(diff) > 1e-3).float()
+            mask = (torch.abs(diff) > 1e-4).float() 
             mapping_penalty = (self.criterion(old_latents, u_safe) * mask).mean()
+            
             value_loss = 0.5 * self.criterion(state_values.squeeze(), scaled_rewards)
-            mapping_penalty_coeff = 0.1  # Hyperparameter to balance the penalty
-            # Combined Loss [cite: 411, 427]
+            mapping_penalty_coeff = 0.05 # Slightly lower to prioritize production reward
+
             loss = -torch.min(surr1, surr2) + \
                 value_loss - \
                 self.entropy_coeff * dist_entropy + \
-                mapping_penalty_coeff * mapping_penalty  # <--- SP-RL Action Aliasing Penalty
+                mapping_penalty_coeff * mapping_penalty
 
             self.optimizer.zero_grad()
             loss.mean().backward()
@@ -212,7 +212,6 @@ class SPRL_Agent:
         self.policy_old.load_state_dict(self.policy.state_dict())
 
 class RunningMeanStd:
-    """Standard normalization utility for stable training."""
     def __init__(self, epsilon=1e-4, shape=()):
         self.mean = np.zeros(shape, 'float64')
         self.var = np.ones(shape, 'float64')
@@ -232,6 +231,4 @@ class RunningMeanStd:
         m_b = batch_var * batch_count
         M2 = m_a + m_b + np.square(delta) * self.count * batch_count / tot_count
         new_var = M2 / tot_count
-        self.mean = new_mean
-        self.var = new_var
-        self.count = tot_count
+        self.mean, self.var, self.count = new_mean, new_var, tot_count

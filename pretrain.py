@@ -12,26 +12,28 @@ from tqdm import tqdm
 from data_gen import get_fresh_batch_dataset
 from torch.amp import autocast, GradScaler
 class ActionProjectionNetwork(nn.Module):
-    def __init__(self, state_dim=3, action_dim=2, latent_dim=512):
+    def __init__(self, state_dim=4, action_dim=2, latent_dim=512): # state_dim is now 4
         super(ActionProjectionNetwork, self).__init__()
         self.net = nn.Sequential(
             nn.Linear(state_dim + action_dim, latent_dim),
             nn.LayerNorm(latent_dim),
             nn.ELU(),
-            
             nn.Linear(latent_dim, latent_dim),
             nn.LayerNorm(latent_dim),
             nn.ELU(),
-            
-            nn.Linear(latent_dim, latent_dim // 2),
-            nn.ELU(),
-            nn.Linear(latent_dim // 2, action_dim) 
+            nn.Linear(latent_dim, action_dim) 
         )
 
     def forward(self, state_norm, nom_act_norm):
+        # nom_act_norm is the "Intent" (z)
         x = torch.cat([state_norm, nom_act_norm], dim=1)
-        delta_norm = self.net(x)
-        return nom_act_norm + delta_norm
+        
+        # Predict the reduction (delta). 
+        # ReLU ensures we only subtract production, never add it.
+        delta = torch.relu(self.net(x)) 
+        
+        # Safe Action = Intent - Reduction
+        return nom_act_norm - delta
 
 def run_pretraining(epochs=40000, batch_size=65536, buffer_size=2000000, refresh_interval=100):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -177,10 +179,18 @@ def run_pretraining(epochs=40000, batch_size=65536, buffer_size=2000000, refresh
             # Forward pass with mixed precision 
             with autocast(device_type='cuda'):
                 pred_y = model(b_s, b_a)
-                is_unsafe = torch.any(torch.abs(b_a - b_y) > 1e-4, dim=1).float()
-                raw_loss = criterion(pred_y, b_y)
-                weights = 1.0 + (is_unsafe * 5.0) 
-                loss = (raw_loss * weights).mean()
+                
+                # Positive error means safe_action_predicted > safe_action_target (UNSAFE)
+                error = pred_y - b_y
+                
+                # Penalize violations 20x more than over-throttling
+                asymmetric_sq_error = torch.where(error > 0, 20.0 * (error**2), error**2)
+                
+                # Identification of correction samples for weighted focus
+                is_corrected = torch.any(torch.abs(b_a - b_y) > 1e-5, dim=1).float()
+                weights = 1.0 + (is_corrected * 9.0)
+                
+                loss = (asymmetric_sq_error * weights.unsqueeze(1)).mean()
 
             # High-throughput backprop
             scaler.scale(loss).backward()
