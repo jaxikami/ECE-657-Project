@@ -33,7 +33,7 @@ class ActionProjectionNetwork(nn.Module):
         delta_norm = self.net(x)
         return nom_act_norm + delta_norm
 
-def run_pretraining(epochs=40000, batch_size=65536, buffer_size=2000000, refresh_interval=50):
+def run_pretraining(epochs=40000, batch_size=65536, buffer_size=2000000, refresh_interval=100):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = ActionProjectionNetwork().to(device)
     a_mean = torch.tensor([0.0, 0.0], device=device)
@@ -56,7 +56,7 @@ def run_pretraining(epochs=40000, batch_size=65536, buffer_size=2000000, refresh
     min_relative_change = 0.001  # 0.1% threshold
     stagnation_counter = 0
     best_ma_value = None
-    relative_change = None
+    relative_change = 0
     # Early Stopping Logic
 # 1. LATENCY PERIOD (start_monitoring_epoch): 
 #    We wait 3,000 epochs before checking for success. This prevents the 
@@ -80,7 +80,7 @@ def run_pretraining(epochs=40000, batch_size=65536, buffer_size=2000000, refresh
 #    to ensure it hasn't overfit to the previous buffer.
 
     early_stop_threshold = 5e-4
-    required_success_per_buffer = 40
+    required_success_per_buffer = 80
     start_monitoring_epoch = 3000
     buffer_success_count = 0
     
