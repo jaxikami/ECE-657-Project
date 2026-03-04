@@ -33,7 +33,7 @@ class ActionProjectionNetwork(nn.Module):
         delta_norm = self.net(x)
         return nom_act_norm + delta_norm
 
-def run_pretraining(epochs=40000, batch_size=65536, buffer_size=2000000, refresh_interval=70):
+def run_pretraining(epochs=40000, batch_size=65536, buffer_size=2000000, refresh_interval=100):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = ActionProjectionNetwork().to(device)
     a_mean = torch.tensor([0.0, 0.0], device=device)
@@ -48,7 +48,7 @@ def run_pretraining(epochs=40000, batch_size=65536, buffer_size=2000000, refresh
     eta_min=1e-5
 )
     # decay_end_epoch = epochs
-    criterion = nn.SmoothL1Loss(beta=0.05)
+    criterion = nn.SmoothL1Loss(beta=0.01)
     history = []
     lr_history = []
     ma_window = 500  # The window for the moving average
@@ -70,17 +70,17 @@ def run_pretraining(epochs=40000, batch_size=65536, buffer_size=2000000, refresh
 #
 # 3. CONSISTENCY REQUIREMENT (required_success_per_buffer): 
 #    Achieving the threshold once isn't enough. The model must maintain 
-#    that precision for 50 epochs within a single data refresh cycle. 
+#    that precision for 80 epochs within a single data refresh cycle. 
 #    This proves the model isn't just "passing through" a lucky local 
 #    minimum but has actually converged.
 #
 # 4. BUFFER RESET (buffer_success_count): 
-#    Because get_fresh_batch_dataset() generates new data every 70 epochs (refresh_interval), we reset the success count to zero. 
+#    Because get_fresh_batch_dataset() generates new data every 100 epochs (refresh_interval), we reset the success count to zero. 
 #    The model must "prove its mastery" all over again on the new data 
 #    to ensure it hasn't overfit to the previous buffer.
 
     early_stop_threshold = 3e-4
-    required_success_per_buffer = 50
+    required_success_per_buffer = 80
     start_monitoring_epoch = 3000
     buffer_success_count = 0
     
