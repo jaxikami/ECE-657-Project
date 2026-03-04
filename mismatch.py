@@ -1,70 +1,81 @@
 import torch
 import numpy as np
 from env import PhotoProductionEnv
-from res_net_agent import ActionProjectionNetwork
+from pretrain import ActionProjectionNetwork # Ensure this matches your pretrain class name
 
-def check_manifold_alignment():
-    # 1. Initialize Environment and Load Safeguard
+def check_stress_test_alignment(num_test_samples=1000):
+    # 1. Setup Environment and Load Weights
     env = PhotoProductionEnv(train_mode=False)
-    # Ensure latent_dim matches your fixed architecture (512)
     safeguard = ActionProjectionNetwork(state_dim=3, action_dim=2, latent_dim=512)
     
     try:
         safeguard.load_state_dict(torch.load("action_projection_network.pth"))
         safeguard.eval()
-        print("✅ Safeguard weights loaded successfully.")
+        norms = np.load("norm_constants.npz")
+        s_mean, s_std = torch.tensor(norms['s_mean']), torch.tensor(norms['s_std'])
     except Exception as e:
-        print(f"❌ Error loading weights: {e}")
+        print(f"❌ Setup Error: {e}")
         return
 
-    # 2. Load Normalization Constants
-    norms = np.load("norm_constants.npz")
-    s_mean, s_std = torch.tensor(norms['s_mean']), torch.tensor(norms['s_std'])
-    a_mean, a_std = torch.tensor(norms['a_mean']), torch.tensor(norms['a_std'])
+    print(f"--- Running Stress Test on {num_test_samples} Boundary Samples ---")
 
-    print("\n--- Diagnostic 1: Light Intensity ($I$) Boundary ---")
-    state = env.reset() # Standard starting point
-    state_t = torch.FloatTensor(state).unsqueeze(0)
-    z_intent = torch.tensor([[1.0, 0.0]]) # Intent: Max Light, No Feed
+    # 2. Generate "Danger Zone" States (Nitrate near 180.0, Biomass high)
+    # Sampling Nitrate in the 175-185 range to see how it handles the "cliff"
+    cN_danger = 175.0 + torch.rand(num_test_samples) * 10.0
+    cx_high = 4.0 + torch.rand(num_test_samples) * 2.0
+    cq_rand = torch.rand(num_test_samples) * 25.0
     
+    states_danger = torch.stack([cx_high, cN_danger, cq_rand], dim=1)
+    
+    # 3. Generate "Aggressive" Intent (Agent wants max Light and max Feed)
+    # Action space is [-1, 1], so [1.0, 1.0] is the most dangerous intent
+    z_intent = torch.ones((num_test_samples, 2)) 
+
+    # 4. Batch Projection
     with torch.no_grad():
-        s_norm = (state_t - s_mean) / (s_std + 1e-8)
-        z_norm = (z_intent - a_mean) / (a_std + 1e-8)
-        u_safe_norm = safeguard(s_norm, z_norm)
-        u_safe = (u_safe_norm * (a_std + 1e-8)) + a_mean
-        u_phys = u_safe.numpy().flatten()
+        # Using the same normalization logic as training
+        s_norm = (states_danger - s_mean) / (s_std + 1e-8)
+        # Note: If your actions are already [-1, 1], normalization might be identity
+        # but we use the training constants for strict consistency.
+        u_safe_norm = safeguard(s_norm, z_intent) 
+        
+        # Denormalize back to physical units for the environment check
+        # Physical I = (norm_val + 1)/2 * 3000
+        # Physical Fn = (norm_val + 1)/2 * 20
+        i_phys = ((u_safe_norm[:, 0] + 1) / 2) * 3000.0
+        fn_phys = ((u_safe_norm[:, 1] + 1) / 2) * 20.0
 
-    _, _, _, info = env.step(u_phys)
-    print(f"Current Biomass: {info['biomass']:.3f}")
-    print(f"Env I_limit: {450.0 / np.exp(-0.25 * info['biomass'] * 0.5):.2f}")
-    print(f"Safeguard I: {(u_phys[0]+1)/2 * 3000:.2f}")
-    print(f"Result: {'✅ SAFE' if info['is_safe'] else '❌ UNSAFE'}")
+    # 5. Statistical Analysis of Violations
+    violations = 0
+    total_i_reduction = 0.0
+    total_fn_reduction = 0.0
 
-    print("\n--- Diagnostic 2: Nitrate ($c_N$) Boundary ---")
-    # Manually set state to be dangerously close to the 180.0 limit
-    env.state = np.array([0.5, 179.0, 5.0]) 
-    state_danger = env.get_state_norm()
-    state_t_danger = torch.FloatTensor(state_danger).unsqueeze(0)
-    
-    # Intent: Maximum Nitrate Feed (z_fn = 1.0)
-    z_intent_fn = torch.tensor([[0.0, 1.0]]) 
-    
-    with torch.no_grad():
-        s_norm = (state_t_danger - s_mean) / (s_std + 1e-8)
-        z_norm = (z_intent_fn - a_mean) / (a_std + 1e-8)
-        u_safe_norm = safeguard(s_norm, z_norm)
-        u_safe = (u_safe_norm * (a_std + 1e-8)) + a_mean
-        u_phys = u_safe.numpy().flatten()
+    for i in range(num_test_samples):
+        # Manually inject state into env to test specific points
+        env.state = states_danger[i].numpy()
+        phys_action = np.array([u_safe_norm[i, 0].item(), u_safe_norm[i, 1].item()])
+        
+        _, _, _, info = env.step(phys_action)
+        
+        if not info['is_safe']:
+            violations += 1
+            
+        # Track how much the safeguard "pushed back"
+        # (Intent was 1.0, 1.0)
+        total_i_reduction += (1.0 - u_safe_norm[i, 0].item())
+        total_fn_reduction += (1.0 - u_safe_norm[i, 1].item())
 
-    _, _, _, info = env.step(u_phys)
-    print(f"Current Nitrate: {info['nitrate']:.2f} (Limit: 180.0)")
-    print(f"Safeguard Feed (Fn): {(u_phys[1]+1)/2 * 20.0:.4f}")
-    
-    if info['is_safe']:
-        print("✅ ALIGNED: Safeguard correctly throttled Feed near the limit.")
+    # 6. Results Summary
+    fail_rate = (violations / num_test_samples) * 100
+    print(f"\n[RESULTS]")
+    print(f"Failure Rate: {fail_rate:.2f}% ({violations}/{num_test_samples} violations)")
+    print(f"Avg Light Throttling: {total_i_reduction/num_test_samples:.4f} units")
+    print(f"Avg Feed Throttling: {total_fn_reduction/num_test_samples:.4f} units")
+
+    if fail_rate < 0.5:
+        print("✅ MANIFOLD ALIGNED: The safeguard is robust at the boundaries.")
     else:
-        print("❌ MISMATCHED: Safeguard allowed Feed that caused a Nitrate violation.")
-        print(f"   Safety Penalty: {info['penalties']['safety']:.4f}")
+        print("⚠️ MISMATCH DETECTED: Consider increasing the 20/80 bias or lowering the LR.")
 
 if __name__ == "__main__":
-    check_manifold_alignment()
+    check_stress_test_alignment()

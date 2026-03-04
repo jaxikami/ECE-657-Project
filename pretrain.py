@@ -33,7 +33,7 @@ class ActionProjectionNetwork(nn.Module):
         delta_norm = self.net(x)
         return nom_act_norm + delta_norm
 
-def run_pretraining(epochs=10000, batch_size=32768, buffer_size=2000000, refresh_interval=100):
+def run_pretraining(epochs=30000, batch_size=32768, buffer_size=2000000, refresh_interval=100):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = ActionProjectionNetwork().to(device)
     
@@ -60,8 +60,9 @@ def run_pretraining(epochs=10000, batch_size=32768, buffer_size=2000000, refresh
     # Hyperparameters with lr decay
     initial_lr = 1e-3
     optimizer = optim.Adam(model.parameters(), lr=initial_lr)
-    decay_end_epoch = (2 / 3) * epochs
-    criterion = nn.SmoothL1Loss(beta=0.1)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-5)
+    decay_end_epoch = epochs
+    criterion = nn.SmoothL1Loss(beta=0.05)
     history = []
     lr_history = []
     
@@ -96,6 +97,7 @@ def run_pretraining(epochs=10000, batch_size=32768, buffer_size=2000000, refresh
     scaler = GradScaler('cuda')
     for epoch in pbar:
         buffer_age = epoch % refresh_interval
+        current_bias = 0.5 + (0.4 * (epoch / epochs))
         noise_scale = max(1e-3, 1e-2 * (1.0 - (epoch / start_monitoring_epoch)))
         
         # This block executes every 'refresh_interval' (e.g., 100 epochs) to prevent 
@@ -133,7 +135,7 @@ def run_pretraining(epochs=10000, batch_size=32768, buffer_size=2000000, refresh
         #    distribution before the standard decay logic takes back over.
         if buffer_age == 0:
             buffer_success_count = 0
-            s_raw, a_raw, y_target = get_fresh_batch_dataset(buffer_size)
+            s_raw, a_raw, y_target = get_fresh_batch_dataset(buffer_size, bias=current_bias)
             
             
             s_raw = s_raw + torch.randn_like(s_raw) * (s_raw.std(0) * noise_scale)
@@ -142,22 +144,20 @@ def run_pretraining(epochs=10000, batch_size=32768, buffer_size=2000000, refresh
             s_norm = (s_raw - s_m) / (s_s + 1e-8)
             a_norm = (a_raw - a_m) / (a_s + 1e-8)
             y_norm = y_target
-            
-            train_ds = TensorDataset(s_norm, a_norm, y_norm)
-            loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+
             
             if epoch > 0:
                 for param_group in optimizer.param_groups:
                     param_group['lr'] = initial_lr * 0.8
 
         # LR Decay
-        if buffer_age != 0:
-            lr_coeff = max(0.0, 1.0 - (epoch / decay_end_epoch))
-            current_lr = max(1e-7, initial_lr * lr_coeff)
-            for param_group in optimizer.param_groups:
-                param_group['lr'] = current_lr
-        else:
-            current_lr = optimizer.param_groups[0]['lr']
+        # if buffer_age != 0:
+        #     lr_coeff = max(0.0, 1.0 - (epoch / decay_end_epoch))
+        #     current_lr = max(1e-5, initial_lr * lr_coeff)
+        #     for param_group in optimizer.param_groups:
+        #         param_group['lr'] = current_lr
+        # else:
+        #     current_lr = optimizer.param_groups[0]['lr']
 
         # Training Execution
         model.train()
@@ -192,6 +192,8 @@ def run_pretraining(epochs=10000, batch_size=32768, buffer_size=2000000, refresh
             
         avg_loss = epoch_loss / (buffer_size / batch_size)
         history.append(avg_loss)
+        scheduler.step()
+        current_lr = scheduler.get_last_lr()[0]
         lr_history.append(current_lr)
 
         # --- Per-Buffer Early Exit Logic ---
