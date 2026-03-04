@@ -11,7 +11,7 @@ from utils import DataLogger, Plotter
 STATE_DIM = 3
 ACTION_DIM = 2
 LATENT_DIM = 2
-MAX_EPISODES = 500000 
+MAX_EPISODES = 50000 
 MAX_STEPS = 7200      
 UPDATE_TIMESTEP = 14400 
 K_EPOCHS = 40
@@ -38,12 +38,20 @@ def apply_linear_decay(agent, episode, total_episodes, base_lr_actor, base_lr_cr
     return current_lr_actor
 
 def train_agent(agent_name, agent, logger):
-    """Trains agent and saves weights to a .pth file upon completion."""
+    """Trains agent with plateau-based early exit and saves weights."""
     print(f"\n--- Starting Training: {agent_name} ---")
     env = PhotoProductionEnv(train_mode=True)
     memory = Memory()
     time_step = 0
     
+    # Plateau Tracking Variables
+    rewards_history = []
+    best_moving_avg = -float('inf')
+    plateau_counter = 0
+    WINDOW_SIZE = 500
+    PATIENCE = 1000
+    IMPROVEMENT_THRESHOLD = 1e-3
+    early_exit_start = 10000
     pbar = tqdm(range(1, MAX_EPISODES + 1), desc=f"Training {agent_name}")
     for i_episode in pbar:
         current_lr = apply_linear_decay(agent, i_episode, MAX_EPISODES, LR_ACTOR, LR_CRITIC)
@@ -77,16 +85,42 @@ def train_agent(agent_name, agent, logger):
             if done: break
             
         logger.log_training_episode(agent_name, current_ep_reward)
+        rewards_history.append(current_ep_reward)
+
+        # --- Early Exit Check ---
+        
+        if len(rewards_history) >= early_exit_start:
+            # Calculate current 500-episode moving average
+            current_moving_avg = np.mean(rewards_history[-WINDOW_SIZE:])
+            
+            # Check for improvement relative to the best moving average
+            if current_moving_avg > (best_moving_avg * (1 + IMPROVEMENT_THRESHOLD)):
+                best_moving_avg = current_moving_avg
+                plateau_counter = 0  # Reset patience if we improved
+            else:
+                plateau_counter += 1 # Increment if no significant gain
+
+            # Check if we've reached the plateau limit
+            if plateau_counter >= PATIENCE:
+                print(f"\n[Early Exit] Plateau reached. No improvement > {IMPROVEMENT_THRESHOLD} in {PATIENCE} episodes.")
+                break
         
         if i_episode % 5 == 0:
+            # Extract specific components for clarity
+            prod_rwd = last_info['reward']['production']
+            saf_pnlty = last_info['penalties']['safety']
+            smth_pnlty = last_info['penalties']['smoothing']
+            bio_pnlty = last_info['penalties']['biomass_efficiency']
+            
             pbar.set_postfix({
-                "Rwd": f"{last_info['reward']['production']:.1f}",
-                "Pnlty": f"{last_info['penalties']['total_penalty']:.1f}",
-                "Safe": "Y" if last_info['is_safe'] else "N",
-                "LR": f"{current_lr:.1e}"
+                "Prod": f"{prod_rwd:.3f}",
+                "Saf": f"{saf_pnlty:.3f}",
+                "Smth": f"{smth_pnlty:.3f}",
+                "Bio": f"{bio_pnlty:.3f}",
+                "Plat": f"{plateau_counter}/{PATIENCE}"
             })
 
-    # --- SAVE WEIGHTS AFTER TRAINING ---
+    # --- SAVE WEIGHTS AFTER TRAINING OR EARLY EXIT ---
     save_path = f"{agent_name}_final_weights.pth"
     torch.save(agent.policy.state_dict(), save_path)
     print(f"Successfully saved weights to {save_path}")

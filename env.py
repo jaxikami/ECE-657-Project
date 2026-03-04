@@ -23,7 +23,7 @@ def calculate_rates_numba(x, u, params):
 
 @njit
 def integrate_rk4(x_init, u, params, dt, n_steps):
-    x = x_init.copy()
+    x = x_init.astype(np.float64)
     step_size = dt / n_steps
     for _ in range(n_steps):
         k1 = calculate_rates_numba(x, u, params)
@@ -67,12 +67,14 @@ class PhotoProductionEnv:
 
     def reset(self):
         self.time_step_count = 0
-        self.state = np.array([0.5, 100.0, 5.0], dtype=np.float32)
+        # Change from float32 to float64 (default)
+        self.state = np.array([0.5, 100.0, 5.0], dtype=np.float64) 
         self.prev_action = np.zeros(self.actionDim)
         return self.get_state_norm()
 
     def get_state_norm(self):
-        norm_scales = np.array([6.0, 200.0, 25.0], dtype=np.float32)
+        # Ensure the normalization scales and return type are float32 for PyTorch compatibility
+        norm_scales = np.array([6.0, 200.0, 25.0], dtype=np.float64)
         return (self.state / norm_scales).astype(np.float32)
 
     def step(self, action):
@@ -101,18 +103,25 @@ class PhotoProductionEnv:
         shading_factor = np.exp(-self.alpha * self.state[0] * self.L)
         i_limit = self.I_crit / (shading_factor + 1e-6)
         
-        is_safe = True
-        if I > i_limit: is_safe = False
-        if self.state[1] > 180.0: is_safe = False
+        i_violation = max(0.0, I - i_limit)
+        n_violation = max(0.0, self.state[1] - 180.0)
+
+        is_safe = (i_violation == 0.0 and n_violation == 0.0)
 
         # 5. Reward vs. Penalty Calculation
         # REWARDS (Positive Gains)
-        reward_prod = self.state[2]  # Phycocyanin concentration
+        reward_prod = self.state[2]/4  # Phycocyanin concentration
         
         # PENALTIES (Negative Values)
-        penalty_safety = -5.0 if not is_safe else 0.0
-        penalty_smoothing = -0.01 * np.mean(np.square(a_clipped - self.prev_action))
-        penalty_biomass = -0.1 * self.state[0]
+        if not is_safe:
+            # Normalize the violation distance by the max possible value to keep scales consistent
+            i_penalty = (i_violation / self.I_max) * 10.0 
+            n_penalty = (n_violation / 200.0) * 10.0
+            penalty_safety = -(1.0 + i_penalty + n_penalty)/5 
+        else:
+            penalty_safety = 0.0
+        penalty_smoothing = -0.3 * np.mean(np.square(a_clipped - self.prev_action))
+        penalty_biomass = -0.05 * self.state[0]
         
         total_reward = reward_prod + penalty_safety + penalty_smoothing + penalty_biomass
         

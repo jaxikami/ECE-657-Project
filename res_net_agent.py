@@ -8,21 +8,17 @@ import os
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 class ActionProjectionNetwork(nn.Module):
-    """
-    Neural safety layer for projecting nominal actions onto the constrained manifold.
-    Must match the architecture in pretrain.py[cite: 12].
-    """
-    def __init__(self, state_dim=3, action_dim=2, latent_dim=1024):
+    def __init__(self, state_dim=3, action_dim=2, latent_dim=512):
         super(ActionProjectionNetwork, self).__init__()
         self.net = nn.Sequential(
             nn.Linear(state_dim + action_dim, latent_dim),
             nn.LayerNorm(latent_dim),
-            nn.LeakyReLU(0.2),
+            nn.ELU(), # Match pretrain.py
             nn.Linear(latent_dim, latent_dim),
             nn.LayerNorm(latent_dim),
-            nn.LeakyReLU(0.2),
+            nn.ELU(), # Match pretrain.py
             nn.Linear(latent_dim, latent_dim // 2),
-            nn.LeakyReLU(0.2),
+            nn.ELU(), # Match pretrain.py
             nn.Linear(latent_dim // 2, action_dim) 
         )
 
@@ -177,7 +173,7 @@ class SPRL_Agent:
                 u_safe_n = self.safeguard(s_n, z_n)
                 u_safe = (u_safe_n * (self.a_std + 1e-8)) + self.a_mean
             
-            mapping_penalty = torch.mean((old_latents - u_safe)**2)
+            mapping_penalty = torch.mean((old_latents - u_safe)**2)*2
 
             # Combined Loss [cite: 411, 427]
             loss = -torch.min(surr1, surr2) + \

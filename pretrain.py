@@ -45,8 +45,10 @@ def run_pretraining(epochs=10000, batch_size=32768, buffer_size=2000000, refresh
     # the model uses the exact same scaling it learned during training.
     print("Initializing manifold normalization constants...")
     s_init, a_init, _ = get_fresh_batch_dataset(500000)
-    s_mean, s_std = s_init.mean(0), s_init.std(0)
-    a_mean, a_std = a_init.mean(0), a_init.std(0)
+    s_mean = torch.tensor([0.0, 0.0, 0.0]) # Or the actual mean of your data
+    s_std = torch.tensor([6.0, 200.0, 25.0]) # Use the env.py denominators
+    a_mean = torch.tensor([0.0, 0.0])
+    a_std = torch.tensor([1.0, 1.0]) # Actions are already -1 to 1
     
     np.savez("norm_constants.npz", 
              s_mean=s_mean.cpu().numpy(), s_std=s_std.cpu().numpy(), 
@@ -139,7 +141,7 @@ def run_pretraining(epochs=10000, batch_size=32768, buffer_size=2000000, refresh
             
             s_norm = (s_raw - s_m) / (s_s + 1e-8)
             a_norm = (a_raw - a_m) / (a_s + 1e-8)
-            y_norm = (y_target - a_m) / (a_s + 1e-8)
+            y_norm = y_target
             
             train_ds = TensorDataset(s_norm, a_norm, y_norm)
             loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
