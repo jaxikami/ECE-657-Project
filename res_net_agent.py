@@ -125,17 +125,29 @@ class SPRL_Agent:
         self.return_rms = RunningMeanStd(shape=())
 
     def select_action(self, state):
-        """SP-RL: Agent picks intent z, Safeguard projects to safe action u_phi[cite: 42, 236]."""
+        """SP-RL: Agent picks intent z, Safeguard projects to safe action u_phi."""
         with torch.no_grad():
-            state_t = torch.FloatTensor(state).to(device)
+            # 'state' comes from the environment as normalized [0, 1] via get_state_norm()
+            # But the safeguard was trained on physical units normalized by s_m_local
+            
+            # 1. Convert the env's [0, 1] state back to physical units first
+            # The env scales are [6.0, 200.0, 25.0]
+            state_phys = state * np.array([6.0, 200.0, 25.0])
+            state_t = torch.FloatTensor(state_phys).to(device)
+            
+            # 2. Agent generates latent intent 'z' (the raw desire)
             z, log_prob = self.policy_old.act(state_t)
             
-            # Normalize for safeguard [cite: 12]
+            # 3. Normalize for the safeguard using the FINAL LOCAL STATS
             s_norm = (state_t.unsqueeze(0) - self.s_mean) / (self.s_std + 1e-8)
+            
+            # Actions/Intents are usually [-1, 1], so a_mean=0, a_std=1
             z_norm = (z.unsqueeze(0) - self.a_mean) / (self.a_std + 1e-8)
             
-            # Project to safe manifold [cite: 13, 202]
+            # 4. Project to safe manifold
             u_phi_norm = self.safeguard(s_norm, z_norm)
+            
+            # 5. Denormalize back to [-1, 1] for the environment
             u_phi = (u_phi_norm * (self.a_std + 1e-8)) + self.a_mean
             
         return u_phi.cpu().numpy().flatten(), z.cpu().numpy(), log_prob.cpu().numpy()

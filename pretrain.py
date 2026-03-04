@@ -33,39 +33,30 @@ class ActionProjectionNetwork(nn.Module):
         delta_norm = self.net(x)
         return nom_act_norm + delta_norm
 
-def run_pretraining(epochs=30000, batch_size=32768, buffer_size=2000000, refresh_interval=100):
+def run_pretraining(epochs=40000, batch_size=65536, buffer_size=2000000, refresh_interval=50):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = ActionProjectionNetwork().to(device)
-    
-    # To ensure stable gradients and faster convergence, we compute global statistics 
-    # (mean and standard deviation) from a large sample of the state-action space.
-    # These constants "standardize" the inputs so the network isn't overwhelmed by 
-    # differing scales between physical units (e.g., velocity vs. position).
-    # Crucial for ensuring that during real-time deployment (inference), 
-    # the model uses the exact same scaling it learned during training.
-    print("Initializing manifold normalization constants...")
-    s_init, a_init, _ = get_fresh_batch_dataset(500000)
-    s_mean = torch.tensor([0.0, 0.0, 0.0]) # Or the actual mean of your data
-    s_std = torch.tensor([6.0, 200.0, 25.0]) # Use the env.py denominators
-    a_mean = torch.tensor([0.0, 0.0])
-    a_std = torch.tensor([1.0, 1.0]) # Actions are already -1 to 1
-    
-    np.savez("norm_constants.npz", 
-             s_mean=s_mean.cpu().numpy(), s_std=s_std.cpu().numpy(), 
-             a_mean=a_mean.cpu().numpy(), a_std=a_std.cpu().numpy())
-
-    s_m, s_s = s_mean.to(device), s_std.to(device)
-    a_m, a_s = a_mean.to(device), a_std.to(device)
-
+    a_mean = torch.tensor([0.0, 0.0], device=device)
+    a_std = torch.tensor([1.0, 1.0], device=device)
     # Hyperparameters with lr decay
     initial_lr = 1e-3
     optimizer = optim.Adam(model.parameters(), lr=initial_lr)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-5)
-    decay_end_epoch = epochs
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+    optimizer, 
+    T_0=refresh_interval, 
+    T_mult=1, 
+    eta_min=1e-5
+)
+    # decay_end_epoch = epochs
     criterion = nn.SmoothL1Loss(beta=0.05)
     history = []
     lr_history = []
-    
+    ma_window = 500  # The window for the moving average
+    check_duration = 100     # How many epochs to monitor for lack of change
+    min_relative_change = 0.001  # 0.1% threshold
+    stagnation_counter = 0
+    best_ma_value = None
+    relative_change = None
     # Early Stopping Logic
 # 1. LATENCY PERIOD (start_monitoring_epoch): 
 #    We wait 3,000 epochs before checking for success. This prevents the 
@@ -79,7 +70,7 @@ def run_pretraining(epochs=30000, batch_size=32768, buffer_size=2000000, refresh
 #
 # 3. CONSISTENCY REQUIREMENT (required_success_per_buffer): 
 #    Achieving the threshold once isn't enough. The model must maintain 
-#    that precision for 80 epochs within a single data refresh cycle. 
+#    that precision for 40 epochs within a single data refresh cycle. 
 #    This proves the model isn't just "passing through" a lucky local 
 #    minimum but has actually converged.
 #
@@ -88,8 +79,8 @@ def run_pretraining(epochs=30000, batch_size=32768, buffer_size=2000000, refresh
 #    The model must "prove its mastery" all over again on the new data 
 #    to ensure it hasn't overfit to the previous buffer.
 
-    early_stop_threshold = 3e-4
-    required_success_per_buffer = 80
+    early_stop_threshold = 5e-4
+    required_success_per_buffer = 40
     start_monitoring_epoch = 3000
     buffer_success_count = 0
     
@@ -98,7 +89,7 @@ def run_pretraining(epochs=30000, batch_size=32768, buffer_size=2000000, refresh
     for epoch in pbar:
         buffer_age = epoch % refresh_interval
         current_bias = 0.5 + (0.4 * (epoch / epochs))
-        noise_scale = max(1e-3, 1e-2 * (1.0 - (epoch / start_monitoring_epoch)))
+        noise_scale = max(5e-3, 1e-2 * (1.0 - (epoch / start_monitoring_epoch)))
         
         # This block executes every 'refresh_interval' (e.g., 100 epochs) to prevent 
         # the model from over-specializing on a single static dataset.
@@ -137,18 +128,25 @@ def run_pretraining(epochs=30000, batch_size=32768, buffer_size=2000000, refresh
             buffer_success_count = 0
             s_raw, a_raw, y_target = get_fresh_batch_dataset(buffer_size, bias=current_bias)
             
+            # NEW: Update the "ruler" to match the current bias/distribution
+            # This ensures the 'Danger Zone' is always spread across the network's input range
+            s_m_local = s_raw.mean(dim=0)
+            s_s_local = torch.clamp(s_raw.std(dim=0), min=1e-8)
             
-            s_raw = s_raw + torch.randn_like(s_raw) * (s_raw.std(0) * noise_scale)
-            a_raw = a_raw + torch.randn_like(a_raw) * (a_raw.std(0) * noise_scale)
+            # Apply noise to the raw data BEFORE normalizing
+            s_raw = s_raw + torch.randn_like(s_raw) * (s_s_local * noise_scale)
             
-            s_norm = (s_raw - s_m) / (s_s + 1e-8)
-            a_norm = (a_raw - a_m) / (a_s + 1e-8)
+            # Normalize using the stats of the CURRENT buffer
+            s_norm = (s_raw - s_m_local) / (s_s_local + 1e-8)
+            a_norm = a_raw # Actions are already -1 to 1
             y_norm = y_target
-
             
-            if epoch > 0:
-                for param_group in optimizer.param_groups:
-                    param_group['lr'] = initial_lr * 0.8
+            
+ 
+            
+            # if epoch > 0:
+            #     for param_group in optimizer.param_groups:
+            #         param_group['lr'] = initial_lr * 0.8
 
         # LR Decay
         # if buffer_age != 0:
@@ -179,7 +177,10 @@ def run_pretraining(epochs=30000, batch_size=32768, buffer_size=2000000, refresh
             # Forward pass with mixed precision 
             with autocast(device_type='cuda'):
                 pred_y = model(b_s, b_a)
-                loss = criterion(pred_y, b_y)
+                is_unsafe = torch.any(torch.abs(b_a - b_y) > 1e-4, dim=1).float()
+                raw_loss = criterion(pred_y, b_y)
+                weights = 1.0 + (is_unsafe * 4.0) 
+                loss = (raw_loss * weights).mean()
 
             # High-throughput backprop
             scaler.scale(loss).backward()
@@ -200,6 +201,28 @@ def run_pretraining(epochs=30000, batch_size=32768, buffer_size=2000000, refresh
         if epoch >= start_monitoring_epoch:
             if avg_loss < early_stop_threshold:
                 buffer_success_count += 1
+            if len(history) >= ma_window:
+                current_ma = np.mean(history[-ma_window:])
+                if best_ma_value is not None:
+                    relative_change = abs(current_ma - best_ma_value) / (best_ma_value + 1e-8)
+                else:
+                    best_ma_value = current_ma  # Initialize on the first calculation
+                    if relative_change < min_relative_change:
+                        stagnation_counter += 1
+                    else:
+                        stagnation_counter = 0
+                        best_ma_value = current_ma
+        if stagnation_counter >= check_duration:
+                print(f"\n⚠️ WARNING: Training concluded early due to STAGNATION.")
+                print(f"Loss MA changed by less than {min_relative_change*100}% for {check_duration} epochs.")
+                
+                # Still perform the Option B save so we don't lose progress
+                np.savez("norm_constants.npz", 
+                         s_mean=s_m_local.cpu().numpy(), 
+                         s_std=s_s_local.cpu().numpy(), 
+                         a_mean=a_mean.cpu().numpy(), 
+                         a_std=a_std.cpu().numpy())
+                break        
 
         pbar.set_postfix({
             'Loss': f'{avg_loss:.2e}', 
@@ -208,7 +231,16 @@ def run_pretraining(epochs=30000, batch_size=32768, buffer_size=2000000, refresh
         })
 
         if buffer_success_count >= required_success_per_buffer:
-            print(f"\n[Success] {buffer_success_count} epochs below {early_stop_threshold} in current buffer.")
+            print(f"\n[Success] {buffer_success_count} epochs below {early_stop_threshold}.")
+            
+            # --- CRITICAL FIX FOR OPTION B ---
+            # Save the FINAL local stats that the model actually learned
+            print(f"Saving FINAL manifold normalization constants (Bias: {current_bias:.2f})...")
+            np.savez("norm_constants.npz", 
+                     s_mean=s_m_local.cpu().numpy(), 
+                     s_std=s_s_local.cpu().numpy(), 
+                     a_mean=a_mean.cpu().numpy(), 
+                     a_std=a_std.cpu().numpy())
             break
 
     # Save weights
