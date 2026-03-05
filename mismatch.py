@@ -78,6 +78,36 @@ def run_synchronized_stress_test(num_test_samples=5000):
             n_violations += 1
 
     print(f"Result: {n_violations} Nitrogen violations (Fail Rate: {(n_violations/num_test_samples)*100:.2f}%)")
+    
+    # --- TEST C: IDENTITY MAPPING CHECK (0.1% Threshold) ---
+    print(f"\n--- [TEST C] Identity Mapping Test ({num_test_samples} samples) ---")
+    
+    # Generate inherently SAFE scenarios
+    cx_safe = torch.rand(num_test_samples, device=device) * 2.0  # Low biomass (high shading)
+    cN_safe = torch.rand(num_test_samples, device=device) * 50.0 # Low Nitrate
+    cq_rand = torch.rand(num_test_samples, device=device) * 25.0
+    
+    states_4d = get_4d_state(cx_safe, cN_safe, cq_rand)
+    
+    # Propose intentionally LOW (Safe) intents
+    # Range [-0.8, -0.5] ensures we are nowhere near the safety boundaries
+    z_intent_safe = -0.8 + torch.rand((num_test_samples, 2), device=device) * 0.3
+
+    with torch.no_grad():
+        s_norm = (states_4d - s_mean) / (s_std + 1e-8)
+        u_safe_out = safeguard(s_norm, z_intent_safe)
+
+    # Calculate Relative Difference
+    # We use a small epsilon to avoid division by zero
+    diff = torch.abs(u_safe_out - z_intent_safe)
+    rel_diff = diff / (torch.abs(z_intent_safe) + 1e-8)
+    
+    # Check for 0.1% (0.001) tolerance
+    identity_violations = torch.sum(rel_diff > 0.001).item()
+    max_val_diff = torch.max(diff).item()
+
+    print(f"Max Absolute Deviation: {max_val_diff:.6f}")
+    print(f"Result: {identity_violations} Identity violations > 0.1%")
 
     # --- FINAL VERDICT ---
     if i_violations == 0 and n_violations == 0:

@@ -6,6 +6,7 @@ from env import PhotoProductionEnv
 from lag_agent import NonResNet_Agent
 from res_net_agent import SPRL_Agent
 from utils import DataLogger, Plotter
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 
 # --- Hyperparameters remain the same ---
 STATE_DIM = 3
@@ -19,7 +20,7 @@ EPS_CLIP = 0.2
 GAMMA = 0.99
 LR_ACTOR = 3e-4
 LR_CRITIC = 1e-3
-MIN_LR = 1e-7  
+MIN_LR = 1e-5 
 ENTROPY_COEFF = 0.01
 
 class Memory:
@@ -28,35 +29,32 @@ class Memory:
     def clear(self):
         del self.states[:], self.actions[:], self.logprobs[:], self.rewards[:], self.is_terminals[:]
 
-def apply_linear_decay(agent, episode, total_episodes, base_lr_actor, base_lr_critic):
-    lr_coeff = max(0.0, 1.0 - (episode / total_episodes))
-    current_lr_actor = max(MIN_LR, base_lr_actor * lr_coeff)
-    current_lr_critic = max(MIN_LR, base_lr_critic * lr_coeff)
-    for i in range(len(agent.optimizer.param_groups) - 1):
-        agent.optimizer.param_groups[i]['lr'] = current_lr_actor
-    agent.optimizer.param_groups[-1]['lr'] = current_lr_critic
-    return current_lr_actor
-
 def train_agent(agent_name, agent, logger):
     print(f"\n--- Starting Training: {agent_name} ---")
     env = PhotoProductionEnv(train_mode=True)
     memory = Memory()
+    scheduler = CosineAnnealingWarmRestarts(
+        agent.optimizer, 
+        T_0=5000, 
+        T_mult=2, 
+        eta_min=MIN_LR
+    )
     time_step = 0
     
     rewards_history = []
     best_moving_avg = -float('inf')
     plateau_counter = 0
-    WINDOW_SIZE = 500
-    PATIENCE = 1000
-    IMPROVEMENT_THRESHOLD = 1e-3
-    early_exit_start = 10000
+    
+    # --- EARLY EXIT HYPERPARAMETERS ---
+    WINDOW_SIZE = 500            # Episodes to average for smoothing
+    PATIENCE = 1000             # Max episodes to wait for improvement
+    IMPROVEMENT_THRESHOLD = 1e-3 # Minimum change to count as improvement
+    EARLY_EXIT_START = 10000    # Don't check for plateaus before this episode
     
     pbar = tqdm(range(1, MAX_EPISODES + 1), desc=f"Training {agent_name}")
     for i_episode in pbar:
-        current_lr = apply_linear_decay(agent, i_episode, MAX_EPISODES, LR_ACTOR, LR_CRITIC)
         state = env.reset()
         
-        # --- NEW: Accumulators for Episode Averages ---
         current_ep_reward = 0
         ep_prod, ep_saf, ep_smth, ep_bio = 0, 0, 0, 0
         steps_taken = 0
@@ -75,7 +73,6 @@ def train_agent(agent_name, agent, logger):
             
             state, reward, done, info = env.step(action)
             
-            # --- NEW: Update Cumulative Totals ---
             current_ep_reward += reward
             ep_prod += info['reward']['production']
             ep_saf += info['penalties']['safety']
@@ -94,21 +91,36 @@ def train_agent(agent_name, agent, logger):
             
         logger.log_training_episode(agent_name, current_ep_reward)
         rewards_history.append(current_ep_reward)
-
-        # Early Exit Logic (omitted for brevity) ...
+        scheduler.step(i_episode)
+        # --- PLATEAU LOGIC IMPLEMENTATION ---
+        if i_episode >= EARLY_EXIT_START:
+            # Calculate moving average of the last WINDOW_SIZE rewards
+            recent_avg = np.mean(rewards_history[-WINDOW_SIZE:])
+            
+            # Check if recent performance is significantly better than the best recorded
+            if recent_avg > (best_moving_avg * (1 + IMPROVEMENT_THRESHOLD)):
+                best_moving_avg = recent_avg
+                plateau_counter = 0 # Reset patience
+            else:
+                plateau_counter += 1
+            
+            # Trigger Early Exit
+            if plateau_counter >= PATIENCE:
+                print(f"\n[Early Exit] {agent_name} reached a plateau at episode {i_episode}.")
+                break
 
         if i_episode % 5 == 0:
-            # Display averages per step for the episode
             pbar.set_postfix({
                 "Total": f"{current_ep_reward:.2f}",
                 "Avg_Prod": f"{ep_prod/steps_taken:.3f}",
                 "Avg_Saf": f"{ep_saf/steps_taken:.3f}",
                 "Avg_Smth": f"{ep_smth/steps_taken:.3f}",
                 "Avg_Bio": f"{ep_bio/steps_taken:.3f}",
-                "Plat": f"{plateau_counter}/{PATIENCE}"
+                "Plat": f"{plateau_counter}/{PATIENCE}",
+                "LR": f"{agent.optimizer.param_groups[0]['lr']:.3e}"
             })
 
-    # --- SAVE WEIGHTS AFTER TRAINING OR EARLY EXIT ---
+    # Save weights after training completes or early exit triggers
     save_path = f"{agent_name}_final_weights.pth"
     torch.save(agent.policy.state_dict(), save_path)
     print(f"Successfully saved weights to {save_path}")
@@ -179,10 +191,11 @@ if __name__ == "__main__":
     
     lag_agent = NonResNet_Agent(STATE_DIM, ACTION_DIM, LR_ACTOR, LR_CRITIC, GAMMA, K_EPOCHS, EPS_CLIP)
     sprl_agent = SPRL_Agent(STATE_DIM, ACTION_DIM, LR_ACTOR, LR_CRITIC, GAMMA, K_EPOCHS, EPS_CLIP, ENTROPY_COEFF, LATENT_DIM)
-    train_active = True
+    train_active = False
     if train_active:
-        train_agent("SPRL", sprl_agent, logger)
         train_agent("NonResNet", lag_agent, logger)
+    train_agent("SPRL", sprl_agent, logger)
+        
     
     evaluate_agent("NonResNet", lag_agent, logger)
     evaluate_agent("SPRL", sprl_agent, logger)

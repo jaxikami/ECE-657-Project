@@ -47,7 +47,7 @@ class PhotoProductionEnv:
         self.actionDim = 2
         
         # Physical Constants
-        self.I_max = 3000.0
+        self.I_max = 1000.0
         self.Fn_max = 20.0
         self.I_crit = 450.0
         self.alpha = 0.25
@@ -116,7 +116,7 @@ class PhotoProductionEnv:
         if not is_safe:
             # Normalize the violation distance by the max possible value to keep scales consistent
             i_penalty = (i_violation / self.I_max) * 10.0 
-            n_penalty = (n_violation / 200.0) * 10.0
+            n_penalty = (n_violation / self.Fn_max) * 10.0
             penalty_safety = -(1.0 + i_penalty + n_penalty)/5 
         else:
             penalty_safety = 0.0

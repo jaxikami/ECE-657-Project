@@ -25,9 +25,15 @@ class ActionProjectionNetwork(nn.Module):
         )
 
     def forward(self, state_norm, nom_act_norm):
-        # Match the Residual Delta logic: Safe = Intent - ReLU(Delta)
         x = torch.cat([state_norm, nom_act_norm], dim=1)
-        delta = torch.relu(self.net(x)) 
+        
+        # Calculate the raw delta (the reduction)
+        raw_delta = self.net(x)
+        
+        # Apply a hard threshold (e.g., 0.001)
+        # If delta is smaller than this, force it to 0.0 (Identity Map)
+        delta = torch.where(raw_delta < 1e-3, torch.zeros_like(raw_delta), torch.relu(raw_delta))
+        
         return nom_act_norm - delta
 
 class ActorCritic(nn.Module):
@@ -194,11 +200,12 @@ class SPRL_Agent:
 
             # Penalty applies if safeguard throttles production
             diff = old_latents - u_safe
-            mask = (torch.abs(diff) > 1e-4).float() 
+            safe_threshold = 0.1
+            mask = (torch.abs(diff) > safe_threshold).float() 
             mapping_penalty = (self.criterion(old_latents, u_safe) * mask).mean()
             
             value_loss = 0.5 * self.criterion(state_values.squeeze(), scaled_rewards)
-            mapping_penalty_coeff = 0.05 # Slightly lower to prioritize production reward
+            mapping_penalty_coeff = 0.01 # Slightly lower to prioritize production reward
 
             loss = -torch.min(surr1, surr2) + \
                 value_loss - \

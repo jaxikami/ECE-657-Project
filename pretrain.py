@@ -25,14 +25,15 @@ class ActionProjectionNetwork(nn.Module):
         )
 
     def forward(self, state_norm, nom_act_norm):
-        # nom_act_norm is the "Intent" (z)
         x = torch.cat([state_norm, nom_act_norm], dim=1)
         
-        # Predict the reduction (delta). 
-        # ReLU ensures we only subtract production, never add it.
-        delta = torch.relu(self.net(x)) 
+        # Calculate the raw delta (the reduction)
+        raw_delta = self.net(x)
         
-        # Safe Action = Intent - Reduction
+        # Apply a hard threshold (e.g., 0.001)
+        # If delta is smaller than this, force it to 0.0 (Identity Map)
+        delta = torch.where(raw_delta < 1e-3, torch.zeros_like(raw_delta), torch.relu(raw_delta))
+        
         return nom_act_norm - delta
 
 def run_pretraining(epochs=10000, batch_size=65536, buffer_size=2000000, refresh_interval=100):
@@ -82,9 +83,9 @@ def run_pretraining(epochs=10000, batch_size=65536, buffer_size=2000000, refresh
 #    The model must "prove its mastery" all over again on the new data 
 #    to ensure it hasn't overfit to the previous buffer.
 
-    early_stop_threshold = 3e-4
+    early_stop_threshold = 1e-4
     required_success_per_buffer = 80
-    start_monitoring_epoch = 3000
+    start_monitoring_epoch = 5000
     buffer_success_count = 0
     
     pbar = tqdm(range(epochs), desc="Training Safety Manifold")
@@ -179,31 +180,36 @@ def run_pretraining(epochs=10000, batch_size=65536, buffer_size=2000000, refresh
             optimizer.zero_grad()
             
             # Forward pass with mixed precision 
+            # In pretrain.py -> Inside the training loop
             with autocast(device_type='cuda'):
                 pred_y = model(b_s, b_a)
-                
-                # Positive error means safe_action_predicted > safe_action_target (UNSAFE)
-                error = pred_y - b_y
-                
-                # Penalize violations 10x more than over-throttling
-                asymmetric_sq_error = torch.where(error > 0, 10 * (error**2), error**2)
-                
-                # Identification of correction samples for weighted focus
-                is_corrected = torch.any(torch.abs(b_a - b_y) > 1e-5, dim=1).float()
-                weights = 1.0 + (is_corrected * 5.0)
-                
-                loss = (asymmetric_sq_error * weights.unsqueeze(1)).mean()
+
+                # Check if the simulator says this action was already safe
+                # (where original intent b_a matches the safe target b_y)
+                is_safe = torch.all(torch.abs(b_a - b_y) < 1e-6, dim=1, keepdim=True)
+
+                # 1. IDENTITY LOSS: For safe samples, any change is an error.
+                # This ensures z == u in the safe zone.
+                loss_identity = torch.mean((pred_y - b_a)**2)
+
+                # 2. PURE SAFETY LOSS: For unsafe samples, only penalize if pred_y > b_y.
+                # We use clamp(min=0) so there is NO penalty for being "too safe."
+                violation = torch.clamp(pred_y - b_y, min=0.0)
+                loss_safety = torch.mean(15 * (violation**2))
+
+                # 3. COMBINE: Use the mask to apply the correct logic to each sample
+                total_loss = torch.where(is_safe, loss_identity, loss_safety).mean()
                 with torch.no_grad():
                     unbiased_mse = torch.mean((pred_y - b_y)**2)
                     
             # High-throughput backprop
-            scaler.scale(loss).backward()
+            scaler.scale(total_loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
             
-            epoch_loss += loss.item()
+            epoch_loss += total_loss.item()
             unbiased_epoch_loss += unbiased_mse.item()
             
         avg_loss = epoch_loss / (buffer_size / batch_size)
