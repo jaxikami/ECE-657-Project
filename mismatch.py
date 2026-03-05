@@ -1,34 +1,35 @@
 import torch
 import numpy as np
 import os
-from env import PhotoProductionEnv
+# We assume the new ActionProjectionNetwork class is available in pretrain.py
 from pretrain import ActionProjectionNetwork 
+
+def static_normalize(states):
+    """Matches the logic in pretrain.py exactly."""
+    max_vals = torch.tensor([6.0, 170.0, 25.0, 1.0], device=states.device)
+    return (states / max_vals) * 2.0 - 1.0
 
 def run_synchronized_stress_test(num_test_samples=5000):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    env = PhotoProductionEnv(train_mode=False) 
     
-    # 1. Load Safeguard and Normalization (Updated state_dim to 4)
+    # 1. Load Safeguard
     safeguard = ActionProjectionNetwork(state_dim=4, action_dim=2).to(device)
-    if not os.path.exists("action_projection_network.pth") or not os.path.exists("norm_constants.npz"):
-        print("❌ Error: Missing files. Run pretrain.py first.")
+    if not os.path.exists("action_projection_network.pth"):
+        print("❌ Error: Missing weights. Run the NEW pretrain.py first.")
         return
 
     safeguard.load_state_dict(torch.load("action_projection_network.pth", map_location=device))
     safeguard.eval()
-
-    norms = np.load("norm_constants.npz")
-    s_mean = torch.tensor(norms['s_mean'], dtype=torch.float32).to(device)
-    s_std = torch.tensor(norms['s_std'], dtype=torch.float32).to(device)
     
-    # Constants from env.py / data_gen.py
+    # Constants for physical verification (from env.py)
     I_MAX, FN_MAX = 3000.0, 20.0
     I_CRIT, ALPHA, L = 450.0, 0.25, 0.5
     N_LIMIT_BUFFER = 180 * 0.95
-    # Helper to calculate the 4th feature (Budget Distance)
-    def get_4d_state(cx, cN, cq):
+
+    def get_4d_state_norm(cx, cN, cq):
         n_dist = torch.clamp(N_LIMIT_BUFFER - cN, min=0.0) / N_LIMIT_BUFFER
-        return torch.stack([cx, cN, cq, n_dist], dim=1)
+        states_raw = torch.stack([cx, cN, cq, n_dist], dim=1)
+        return static_normalize(states_raw)
 
     # --- TEST A: LIGHT CONSTRAINT (I) ---
     print(f"\n--- [TEST A] Light Constraint Stress Test ({num_test_samples} samples) ---")
@@ -36,18 +37,16 @@ def run_synchronized_stress_test(num_test_samples=5000):
     cN_safe = torch.full((num_test_samples,), 50.0, device=device) 
     cq_rand = torch.rand(num_test_samples, device=device) * 25.0
     
-    # Generate 4D state for Test A
-    states_i_4d = get_4d_state(cx_test, cN_safe, cq_rand)
     z_intent_max = torch.ones((num_test_samples, 2), device=device) 
 
     with torch.no_grad():
-        s_norm_i = (states_i_4d - s_mean) / (s_std + 1e-8)
-        # Safeguard now returns (intent - delta)
+        s_norm_i = get_4d_state_norm(cx_test, cN_safe, cq_rand)
         u_safe_i = safeguard(s_norm_i, z_intent_max).cpu().numpy()
 
     i_violations = 0
     for i in range(num_test_samples):
         shading = np.exp(-ALPHA * cx_test[i].item() * L)
+        # We test against 0.96 because training was at 0.95 (1% tolerance)
         i_limit_phys = (I_CRIT / (shading + 1e-6)) * 0.96
         i_phys = ((u_safe_i[i, 0] + 1.0) / 2.0) * I_MAX
         
@@ -61,11 +60,8 @@ def run_synchronized_stress_test(num_test_samples=5000):
     cx_safe = torch.full((num_test_samples,), 1.0, device=device) 
     cN_test = torch.linspace(150.0, 170.0, num_test_samples, device=device)
     
-    # Generate 4D state for Test B
-    states_n_4d = get_4d_state(cx_safe, cN_test, cq_rand)
-
     with torch.no_grad():
-        s_norm_n = (states_n_4d - s_mean) / (s_std + 1e-8)
+        s_norm_n = get_4d_state_norm(cx_safe, cN_test, cq_rand)
         u_safe_n = safeguard(s_norm_n, z_intent_max).cpu().numpy()
 
     n_violations = 0
@@ -73,7 +69,7 @@ def run_synchronized_stress_test(num_test_samples=5000):
         current_cN = cN_test[i].item()
         fn_phys = ((u_safe_n[i, 1] + 1.0) / 2.0) * FN_MAX
         
-        # Predicted next state must be below 95% threshold
+        # Predicted next state must be below 96% threshold
         if (current_cN + fn_phys) > (180.0 * 0.96):
             n_violations += 1
 
@@ -81,39 +77,28 @@ def run_synchronized_stress_test(num_test_samples=5000):
     
     # --- TEST C: IDENTITY MAPPING CHECK (0.1% Threshold) ---
     print(f"\n--- [TEST C] Identity Mapping Test ({num_test_samples} samples) ---")
+    cx_safe = torch.rand(num_test_samples, device=device) * 2.0
+    cN_safe = torch.rand(num_test_samples, device=device) * 50.0
     
-    # Generate inherently SAFE scenarios
-    cx_safe = torch.rand(num_test_samples, device=device) * 2.0  # Low biomass (high shading)
-    cN_safe = torch.rand(num_test_samples, device=device) * 50.0 # Low Nitrate
-    cq_rand = torch.rand(num_test_samples, device=device) * 25.0
-    
-    states_4d = get_4d_state(cx_safe, cN_safe, cq_rand)
-    
-    # Propose intentionally LOW (Safe) intents
-    # Range [-0.8, -0.5] ensures we are nowhere near the safety boundaries
     z_intent_safe = -0.8 + torch.rand((num_test_samples, 2), device=device) * 0.3
 
     with torch.no_grad():
-        s_norm = (states_4d - s_mean) / (s_std + 1e-8)
+        s_norm = get_4d_state_norm(cx_safe, cN_safe, cq_rand)
         u_safe_out = safeguard(s_norm, z_intent_safe)
 
-    # Calculate Relative Difference
-    # We use a small epsilon to avoid division by zero
     diff = torch.abs(u_safe_out - z_intent_safe)
     rel_diff = diff / (torch.abs(z_intent_safe) + 1e-8)
     
-    # Check for 0.1% (0.001) tolerance
     identity_violations = torch.sum(rel_diff > 0.001).item()
     max_val_diff = torch.max(diff).item()
 
     print(f"Max Absolute Deviation: {max_val_diff:.6f}")
     print(f"Result: {identity_violations} Identity violations > 0.1%")
 
-    # --- FINAL VERDICT ---
-    if i_violations == 0 and n_violations == 0:
-        print("\n🚀 EXCELLENT: Both constraints perfectly enforced with Residual Delta logic.")
+    if i_violations == 0 and n_violations == 0 and identity_violations == 0:
+        print("\n🚀 SUCCESS: Static Normalization + Residual logic passed all tests.")
     else:
-        print("\n⚠️ WARNING: Violations detected. Ensure pretrain.py uses Asymmetric Loss.")
+        print("\n⚠️ WARNING: Minor violations remain. Consider increasing safety_loss weight.")
 
 if __name__ == "__main__":
     run_synchronized_stress_test()

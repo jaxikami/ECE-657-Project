@@ -13,7 +13,7 @@ STATE_DIM = 3
 ACTION_DIM = 2
 LATENT_DIM = 2
 MAX_EPISODES = 50000 
-MAX_STEPS = 7200      
+MAX_STEPS = 200      
 UPDATE_TIMESTEP = 14400 
 K_EPOCHS = 40
 EPS_CLIP = 0.2
@@ -21,7 +21,7 @@ GAMMA = 0.99
 LR_ACTOR = 3e-4
 LR_CRITIC = 1e-3
 MIN_LR = 1e-5 
-ENTROPY_COEFF = 0.01
+ENTROPY_COEFF = 0.05
 
 class Memory:
     def __init__(self):
@@ -46,10 +46,10 @@ def train_agent(agent_name, agent, logger):
     plateau_counter = 0
     
     # --- EARLY EXIT HYPERPARAMETERS ---
-    WINDOW_SIZE = 500            # Episodes to average for smoothing
-    PATIENCE = 1000             # Max episodes to wait for improvement
-    IMPROVEMENT_THRESHOLD = 1e-3 # Minimum change to count as improvement
-    EARLY_EXIT_START = 10000    # Don't check for plateaus before this episode
+    WINDOW_SIZE = 500            
+    PATIENCE = 1000             
+    IMPROVEMENT_THRESHOLD = 1e-3 
+    EARLY_EXIT_START = 10000    
     
     pbar = tqdm(range(1, MAX_EPISODES + 1), desc=f"Training {agent_name}")
     for i_episode in pbar:
@@ -92,19 +92,17 @@ def train_agent(agent_name, agent, logger):
         logger.log_training_episode(agent_name, current_ep_reward)
         rewards_history.append(current_ep_reward)
         scheduler.step(i_episode)
+        
         # --- PLATEAU LOGIC IMPLEMENTATION ---
         if i_episode >= EARLY_EXIT_START:
-            # Calculate moving average of the last WINDOW_SIZE rewards
             recent_avg = np.mean(rewards_history[-WINDOW_SIZE:])
             
-            # Check if recent performance is significantly better than the best recorded
             if recent_avg > (best_moving_avg * (1 + IMPROVEMENT_THRESHOLD)):
                 best_moving_avg = recent_avg
-                plateau_counter = 0 # Reset patience
+                plateau_counter = 0 
             else:
                 plateau_counter += 1
             
-            # Trigger Early Exit
             if plateau_counter >= PATIENCE:
                 print(f"\n[Early Exit] {agent_name} reached a plateau at episode {i_episode}.")
                 break
@@ -125,6 +123,10 @@ def train_agent(agent_name, agent, logger):
     torch.save(agent.policy.state_dict(), save_path)
     print(f"Successfully saved weights to {save_path}")
 
+    # --- SAVE PLOT IMMEDIATELY ---
+    # Call the updated Plotter method with the specific agent name
+    Plotter.plot_training_results(logger.training_log, agent_name=agent_name)
+
 def evaluate_agent(agent_name, agent, logger, eval_episodes=100):
     """Loads weights from .pth file and runs deterministic evaluation."""
     print(f"\n--- Evaluating: {agent_name} ---")
@@ -142,7 +144,6 @@ def evaluate_agent(agent_name, agent, logger, eval_episodes=100):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     all_states, all_actions, all_rewards, all_infos = [], [], [], []
     
-    # Initialize pbar similar to training
     pbar = tqdm(range(eval_episodes), desc=f"Eval {agent_name}")
     
     for _ in pbar:
@@ -170,35 +171,40 @@ def evaluate_agent(agent_name, agent, logger, eval_episodes=100):
             state = next_state
             if done: break
         
-        # --- Update pbar with metrics from the completed episode ---
-        last_info = ep_infos[-1]
         total_ep_reward = sum(ep_rewards)
+        last_info = ep_infos[-1]
         
         pbar.set_postfix({
             "Total": f"{total_ep_reward:.3f}",
             "Prod": f"{last_info['reward']['production']:.3f}",
-            "Saf": f"{last_info['penalties']['safety']:.3f}",
-            "Smth": f"{last_info['penalties']['smoothing']:.3f}",
-            "Bio": f"{last_info['penalties']['biomass_efficiency']:.3f}"
+            "Saf": f"{last_info['penalties']['safety']:.3f}"
         })
             
+        # Store the last evaluated trajectory for plotting
         all_states, all_actions, all_rewards, all_infos = ep_states, ep_actions, ep_rewards, ep_infos
 
     logger.log_evaluation_trajectory(agent_name, all_states, all_actions, all_rewards, all_infos)
+    
+    # --- SAVE PLOT IMMEDIATELY ---
+    Plotter.plot_evaluation_trajectories(logger.eval_data, agent_name=agent_name)
 
 if __name__ == "__main__":
     logger = DataLogger()
     
+    # Initialize Agents
     lag_agent = NonResNet_Agent(STATE_DIM, ACTION_DIM, LR_ACTOR, LR_CRITIC, GAMMA, K_EPOCHS, EPS_CLIP)
     sprl_agent = SPRL_Agent(STATE_DIM, ACTION_DIM, LR_ACTOR, LR_CRITIC, GAMMA, K_EPOCHS, EPS_CLIP, ENTROPY_COEFF, LATENT_DIM)
+    
+    # --- TRAINING PHASE ---
+    # Training functions now automatically save plots for each agent immediately upon completion.
     train_active = False
     if train_active:
         train_agent("NonResNet", lag_agent, logger)
     train_agent("SPRL", sprl_agent, logger)
         
-    
+    # --- EVALUATION PHASE ---
+    # Evaluation functions now automatically save trajectory plots for each agent after testing.
     evaluate_agent("NonResNet", lag_agent, logger)
     evaluate_agent("SPRL", sprl_agent, logger)
     
-    Plotter.plot_training_results(logger.training_log)
-    Plotter.plot_evaluation_trajectories(logger.eval_data)
+    print("\nAll training and evaluation runs are complete. Plots have been saved to the local directory.")
