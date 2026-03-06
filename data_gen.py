@@ -1,70 +1,70 @@
 import torch
 
 def get_fresh_batch_dataset(num_samples=450000, bias=0.5, device='cuda'):
-    # 1. Physical Constants (Must match env.py exactly)
-    I_MAX = 3000.0
-    FN_MAX = 20.0
-    I_CRIT = 450.0
-    ALPHA = 0.25
-    L = 0.5
-    N_LIMIT = 180.0
+    # 1. Physical Constants (Directly from the article case study)
+    I_MIN = 120.0               # Absolute physical minimum light 
+    I_MAX = 400.0               # Absolute physical maximum light 
+    FN_MAX = 40.0               # Absolute physical maximum nitrate feed [cite: 2136]
+    N_LIMIT_PATH = 800.0        # g1: Nitrate path constraint [cite: 2120]
+    RATIO_LIMIT = 0.011         # g2: Bioproduct/biomass ratio limit [cite: 2128]
+    CONTROL_INTERVAL = 20.0     # 20-hour predictive window for nitrate budget
+    SAFE_BUFFER = 0.98          # 2% safety room for constraint boundaries
 
-    # 2. Define 20/80 Split
+    # 2. Define High/Low Bias Split
     n_high = int(num_samples * bias)
     n_low = num_samples - n_high
     
-    # --- BIAS FOR BIOMASS (cx) --- 
-    cx_uniform = torch.rand(n_low, device=device) * 6.0
-    cx_high = 4.0 + torch.rand(n_high, device=device) * 2.0
-    cx = torch.cat([cx_uniform, cx_high])
+    # --- State Sampling ---
+    # Biomass (cx): 0 to 6 g/L
+    cx = torch.rand(num_samples, device=device) * 6.0
 
-    # --- BIAS FOR NITRATE (cN) ---
-    # 1. Uniformly sample across the new 0-170 range
-    cN_uniform = torch.rand(n_low, device=device) * 170.0
-    
-    # 2. Focus high-bias samples on the top edge (150-170)
-    # This ensures the model sees many cases where a small action triggers a violation
-    cN_boundary = 150.0 + torch.rand(n_high, device=device) * 20.0
-    
+    # Nitrate (cN): Focused sampling near the 800 mg/L limit
+    cN_uniform = torch.rand(n_low, device=device) * N_LIMIT_PATH
+    cN_boundary = 750.0 + torch.rand(n_high, device=device) * 50.0
     cN = torch.cat([cN_uniform, cN_boundary])
     
-    cq = torch.rand(num_samples, device=device) * 25.0
-    
-    # 3. Sample Actions: Force "Dangerous" Intent
-    a_nom_low = torch.rand(n_low, 2, device=device) * 2.0 - 1.0
-    
-    # CRITICAL CHANGE: In the high-bias group, we force actions to be high (0.5 to 0.9).
-    # Since cN is already high here, high fn_phys will trigger the Nitrogen budget.
-    a_nom_high = 0.5 + torch.rand(n_high, 2, device=device) * 0.4 
-    a_nom = torch.cat([a_nom_low, a_nom_high])
+    # Bioproduct (cq): Focused sampling near the 0.011 ratio limit
+    cq_low = torch.rand(n_low, device=device) * (cx[:n_low] * RATIO_LIMIT)
+    cq_high = (0.9 + torch.rand(n_high, device=device) * 0.6) * (cx[n_low:] * RATIO_LIMIT)
+    cq = torch.cat([cq_low, cq_high])
+
+    # t_norm: Normalized Time (0 to 1) for finite horizon
+    t_norm = torch.rand(num_samples, device=device)
+
+    # 3. Sample Actions (Intent z) in [-1, 1]
+    a_nom = torch.rand(num_samples, 2, device=device) * 2.0 - 1.0
     
     # 4. Denormalize Actions to Physical Units
+    # Using the full absolute range [120, 400] as requested
     a_scaled = (a_nom + 1.0) / 2.0
-    i_phys = a_scaled[:, 0] * I_MAX
+    i_phys = I_MIN + a_scaled[:, 0] * (I_MAX - I_MIN)
     fn_phys = a_scaled[:, 1] * FN_MAX
     
-    # 5. Apply Physical Constraints with Buffer
-    # --- Light Constraint ---
-    shading = torch.exp(-ALPHA * cx * L)
-    i_limit = I_CRIT / (shading + 1e-6)
-    i_safe_phys = torch.minimum(i_phys, i_limit * 0.95)
+    # 5. Apply Constraints to Determine Target Actions
     
-    # --- Nitrogen Constraint: Preventative Budgeting ---
-    n_buffer_target = N_LIMIT * 0.95
-    fn_budget = torch.clamp(n_buffer_target - cN, min=0.0)
-    fn_safe_phys = torch.minimum(fn_phys, fn_budget)
+    # --- g1: Nitrate Path Constraint (10h Accumulation) ---
+    # Ensures current_N + (Fn * 10h) <= 800 * 0.98
+    n_max_allowed = N_LIMIT_PATH * SAFE_BUFFER
+    fn_budget = (n_max_allowed - cN) / CONTROL_INTERVAL
+    fn_safe_phys = torch.clamp(fn_budget, min=0.0, max=FN_MAX)
+    fn_target_phys = torch.minimum(fn_phys, fn_safe_phys)
 
-    # Calculate the "Distance to Wall" for the 4th state feature
-    n_distance = torch.relu(n_buffer_target - cN)
-    n_distance_norm = n_distance / n_buffer_target
+    # --- g2: Ratio Constraint Trigger ---
+    # Triggered when current bioproduct ratio exceeds 98% of the limit
+    ratio_threshold = cx * RATIO_LIMIT * SAFE_BUFFER
+    ratio_violation = cq > ratio_threshold
+    
+    # Target behavior: If violating ratio, drop Light (I) to the minimum (120)
+    i_target_phys = torch.where(ratio_violation, torch.full_like(i_phys, I_MIN), i_phys)
 
-    # 6. Re-normalize Safe Physical Actions back to [-1, 1]
-    i_safe_norm = (i_safe_phys / I_MAX) * 2.0 - 1.0
-    fn_safe_norm = (fn_safe_phys / FN_MAX) * 2.0 - 1.0
+    # 6. Re-normalize Target Actions back to [-1, 1]
+    # Normalization matches the full absolute physical range
+    i_target_norm = ((i_target_phys - I_MIN) / (I_MAX - I_MIN)) * 2.0 - 1.0
+    fn_target_norm = (fn_target_phys / FN_MAX) * 2.0 - 1.0
     
     # 7. Stack Outputs
-    states = torch.stack([cx, cN, cq, n_distance_norm], dim=1)
+    states = torch.stack([cx, cN, cq, t_norm], dim=1)
     nom_actions = a_nom
-    target_actions = torch.stack([i_safe_norm, fn_safe_norm], dim=1)
+    target_actions = torch.stack([i_target_norm, fn_target_norm], dim=1)
     
     return states, nom_actions, target_actions

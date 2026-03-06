@@ -1,20 +1,27 @@
 import os
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
-
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import numpy as np
 import matplotlib.pyplot as plt
+import numpy as np # Added for moving average calculation
 from tqdm import tqdm
 from data_gen import get_fresh_batch_dataset
 from torch.amp import autocast, GradScaler
 
+# Hardware compatibility
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
 class ActionProjectionNetwork(nn.Module):
     def __init__(self, state_dim=4, action_dim=2, latent_dim=512):
         super(ActionProjectionNetwork, self).__init__()
+        
+        # Internal Normalization Constants (Article Case Study Limits)
+        # Order: [Biomass (cx), Nitrate (cN), Product (cq), Time (t_norm)]
+        self.register_buffer("max_vals", torch.tensor([6.0, 800.0, 0.1, 1.0]))
+        
         self.input_layer = nn.Linear(state_dim + action_dim, latent_dim)
         
+        # Residual Block with Internal LayerNorm
         self.res_block1 = nn.Sequential(
             nn.Linear(latent_dim, latent_dim),
             nn.LayerNorm(latent_dim),
@@ -22,58 +29,65 @@ class ActionProjectionNetwork(nn.Module):
             nn.Linear(latent_dim, latent_dim),
             nn.LayerNorm(latent_dim)
         )
+        
         self.final_layer = nn.Linear(latent_dim, action_dim)
         
+        # Initialize final layer near zero to encourage identity mapping initially
         nn.init.uniform_(self.final_layer.weight, -1e-4, 1e-4)
         nn.init.constant_(self.final_layer.bias, 0)
         self.elu = nn.ELU()
 
-    def forward(self, state_norm, nom_act_norm):
+    def forward(self, state_phys, nom_act_norm):
+        """
+        Args:
+            state_phys: Raw physical states [batch, 4]
+            nom_act_norm: Normalized nominal actions [-1, 1]
+        """
+        # 1. Integrated Static Normalization
+        state_norm = (state_phys / self.max_vals) * 2.0 - 1.0
+        
+        # 2. Initial Projection
         x_in = torch.cat([state_norm, nom_act_norm], dim=1)
-        x = self.elu(self.input_layer(x_in))
+        x_proj = self.elu(self.input_layer(x_in))
         
-        identity = x
-        x = self.res_block1(x)
-        x = self.elu(x + identity) 
+        # 3. Skip Connection (Residual Connection) for efficiency
+        x_res = self.res_block1(x_proj)
+        x_combined = self.elu(x_res + x_proj) # Global skip connection
         
-        # u = z - delta
-        return nom_act_norm - torch.relu(self.final_layer(x))
+        # 4. Final Residual Projection (u = z - delta)
+        # ReLU ensures we only move the action in the safety-correction direction
+        delta = torch.relu(self.final_layer(x_combined))
+        return nom_act_norm - delta
 
-def static_normalize(states):
-    # Fixed physical limits to prevent vanishing features and coordinate shocks
-    max_vals = torch.tensor([6.0, 170.0, 25.0, 1.0], device=states.device)
-    return (states / max_vals) * 2.0 - 1.0
-
-def run_pretraining(epochs=30000, batch_size=65536, buffer_size=2000000, refresh_interval=100):
+def run_pretraining(epochs=40000, batch_size=65536, buffer_size=2000000, refresh_interval=100):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = ActionProjectionNetwork().to(device)
+    model = ActionProjectionNetwork(state_dim=4).to(device)
     optimizer = optim.Adam(model.parameters(), lr=1e-3)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
         optimizer, T_0=refresh_interval, T_mult=1, eta_min=1e-5
     )
 
-    # Logging histories
-    raw_history = []      # Total Loss (Identity + Weighted Safety)
-    unbiased_history = [] # Pure MSE (Closeness to Target)
-    
-    early_stop_threshold = 1e-5
-    required_success_per_buffer = 80
-    start_monitoring_epoch = 4000
+    raw_history = []      
+    unbiased_history = [] 
+    early_stop_threshold = 5e-6
+    required_success_per_buffer = 50
     buffer_success_count = 0
     
-    pbar = tqdm(range(epochs), desc="Training Safety Manifold")
+    # --- PLATEAU EXIT SETUP ---
+    best_moving_avg = float('inf')
+    plateau_counter = 0
+    patience = 1000
+    window_size = 200
+    improvement_threshold = 0.001 # 0.1% improvement
+    
+    pbar = tqdm(range(epochs), desc="Training Safeguard Manifold")
     scaler = GradScaler('cuda')
 
     for epoch in pbar:
-        buffer_age = epoch % refresh_interval
-        current_bias = 0.5 + (0.4 * (epoch / epochs)) 
-        
-        if buffer_age == 0:
+        if epoch % refresh_interval == 0:
             buffer_success_count = 0
-            s_raw, a_raw, y_target = get_fresh_batch_dataset(buffer_size, bias=current_bias)
-            s_norm = static_normalize(s_raw)
-            a_norm = a_raw 
-            y_norm = y_target
+            # Fetch fresh batch with 10h budget logic
+            s_raw, a_norm, y_target = get_fresh_batch_dataset(buffer_size, bias=0.5)
 
         model.train()
         epoch_raw_loss = 0
@@ -82,27 +96,25 @@ def run_pretraining(epochs=30000, batch_size=65536, buffer_size=2000000, refresh
         
         for i in range(0, buffer_size, batch_size):
             batch_idx = indices[i : i + batch_size]
-            b_s, b_a, b_y = s_norm[batch_idx], a_norm[batch_idx], y_norm[batch_idx]
+            b_s, b_a, b_y = s_raw[batch_idx], a_norm[batch_idx], y_target[batch_idx]
 
             optimizer.zero_grad()
             with autocast(device_type='cuda'):
                 pred_y = model(b_s, b_a)
+                
+                # Check if the original intent was already safe
                 is_safe = torch.all(torch.abs(b_a - b_y) < 1e-7, dim=1, keepdim=True)
 
-                # 1. Identity Loss (u should equal z if already safe)
-                identity_weight = 5.0 - (epoch / epochs)
+                # 1. Identity Penalty: Punished for deviating if already safe
+                identity_weight = 8.0 - (2.0 * (epoch / epochs))
                 loss_identity = identity_weight * torch.mean((pred_y - b_a)**2)
 
-                # 2. Safety Loss (High pressure on violations)
-                safety_weight = 5.0 + (15.0 * (epoch / epochs))
+                # 2. Safety Penalty: Punished for violating boundaries (g1, g2)
+                safety_weight = 10.0 + (30.0 * (epoch / epochs))
                 violation = torch.clamp(pred_y - b_y, min=0.0)
                 loss_safety = torch.mean(safety_weight * (violation**2))
 
-                # 3. Combined Raw Loss
-                
                 total_loss = torch.where(is_safe, loss_identity, loss_safety).mean()
-                
-                # 4. Unbiased MSE for convergence monitoring
                 unbiased_mse = torch.mean((pred_y - b_y)**2)
                 
             scaler.scale(total_loss).backward()
@@ -112,36 +124,49 @@ def run_pretraining(epochs=30000, batch_size=65536, buffer_size=2000000, refresh
             epoch_raw_loss += total_loss.item()
             epoch_unbiased_loss += unbiased_mse.item()
             
-        avg_raw = epoch_raw_loss / (buffer_size / batch_size)
         avg_unbiased = epoch_unbiased_loss / (buffer_size / batch_size)
-        
-        raw_history.append(avg_raw)
+        raw_history.append(epoch_raw_loss / (buffer_size / batch_size))
         unbiased_history.append(avg_unbiased)
         scheduler.step()
 
-        if epoch >= start_monitoring_epoch and avg_unbiased < early_stop_threshold:
+        # --- PLATEAU LOGIC ---
+        if len(unbiased_history) >= window_size:
+            current_moving_avg = np.mean(unbiased_history[-window_size:])
+            
+            # Check for at least 0.1% improvement over the best-ever moving average
+            if current_moving_avg < best_moving_avg * (1 - improvement_threshold):
+                best_moving_avg = current_moving_avg
+                plateau_counter = 0
+            else:
+                plateau_counter += 1
+
+        # Check for convergence success (low MSE)
+        if epoch >= 5000 and avg_unbiased < early_stop_threshold:
             buffer_success_count += 1
 
         pbar.set_postfix({
-            'Raw': f'{avg_raw:.2e}', 
             'MSE': f'{avg_unbiased:.2e}', 
-            'Success': f"{buffer_success_count}/{required_success_per_buffer}"
+            'Patience': f'{plateau_counter}/{patience}',
+            'Stable': f"{buffer_success_count}/{required_success_per_buffer}"
         })
 
+        # --- EARLY EXIT CONDITIONS ---
         if buffer_success_count >= required_success_per_buffer:
-            print(f"\n[Success] Converged at epoch {epoch}")
+            print(f"\n[Success] Safety Manifold Converged (MSE threshold) at epoch {epoch}")
+            break
+        
+        if plateau_counter >= patience:
+            print(f"\n[Plateau] No 0.1% improvement for {patience} epochs. Terminating.")
             break
 
     torch.save(model.state_dict(), "action_projection_network.pth")
     
-    # Plotting both losses
     plt.figure(figsize=(10, 6))
-    plt.plot(raw_history, label='Total Raw Loss (Weighted)', alpha=0.4)
+    plt.plot(raw_history, label='Total Weighted Loss', alpha=0.5)
     plt.yscale('log')
     plt.xlabel("Epochs")
     plt.ylabel("Loss")
-    plt.legend()
-    plt.title("Manifold Convergence: Raw vs Unbiased Loss")
+    plt.title("Safeguard Convergence: Combined Identity & Safety Optimization")
     plt.grid(True, which="both", linestyle="--", alpha=0.5)
     plt.savefig("manifold_convergence.png")
     plt.show()

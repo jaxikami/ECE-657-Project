@@ -1,13 +1,7 @@
 import torch
 import numpy as np
 import os
-# We assume the new ActionProjectionNetwork class is available in pretrain.py
 from pretrain import ActionProjectionNetwork 
-
-def static_normalize(states):
-    """Matches the logic in pretrain.py exactly."""
-    max_vals = torch.tensor([6.0, 170.0, 25.0, 1.0], device=states.device)
-    return (states / max_vals) * 2.0 - 1.0
 
 def run_synchronized_stress_test(num_test_samples=5000):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -15,90 +9,101 @@ def run_synchronized_stress_test(num_test_samples=5000):
     # 1. Load Safeguard
     safeguard = ActionProjectionNetwork(state_dim=4, action_dim=2).to(device)
     if not os.path.exists("action_projection_network.pth"):
-        print("❌ Error: Missing weights. Run the NEW pretrain.py first.")
+        print("❌ Error: Missing weights. Run pretrain.py first.")
         return
 
     safeguard.load_state_dict(torch.load("action_projection_network.pth", map_location=device))
     safeguard.eval()
     
-    # Constants for physical verification (from env.py)
-    I_MAX, FN_MAX = 3000.0, 20.0
-    I_CRIT, ALPHA, L = 450.0, 0.25, 0.5
-    N_LIMIT_BUFFER = 180 * 0.95
+    # Physical Constants
+    I_MIN, I_MAX = 120.0, 400.0
+    FN_MAX = 40.0
+    N_LIMIT = 800.0
+    RATIO_LIMIT = 0.011
+    TOTAL_TIME = 240.0
+    CONTROL_FREQ = 20.0
+    SIGMA = 0.05  # 5% Gaussian deviation
 
-    def get_4d_state_norm(cx, cN, cq):
-        n_dist = torch.clamp(N_LIMIT_BUFFER - cN, min=0.0) / N_LIMIT_BUFFER
-        states_raw = torch.stack([cx, cN, cq, n_dist], dim=1)
-        return static_normalize(states_raw)
+    def denorm_fn(val_norm):
+        return ((val_norm + 1.0) / 2.0) * FN_MAX
 
-    # --- TEST A: LIGHT CONSTRAINT (I) ---
-    print(f"\n--- [TEST A] Light Constraint Stress Test ({num_test_samples} samples) ---")
-    cx_test = torch.linspace(0.1, 6.0, num_test_samples, device=device)
-    cN_safe = torch.full((num_test_samples,), 50.0, device=device) 
-    cq_rand = torch.rand(num_test_samples, device=device) * 25.0
+    def denorm_i(val_norm):
+        return I_MIN + ((val_norm + 1.0) / 2.0) * (I_MAX - I_MIN)
+
+    def gaussian_sample(mean, std_scale=SIGMA):
+        """Helper to sample around a mean with 0.05 relative deviation."""
+        return torch.normal(mean, mean * std_scale, (num_test_samples,), device=device)
+
+    # --- TEST 1: Nitrate Accumulation (20h Window) ---
+    print(f"\n--- [TEST 1] g1: 20h Predictive Budget (Target < {N_LIMIT*0.995}) ---")
+    t_norm = torch.rand(num_test_samples, device=device)
+    t_phys = t_norm * TOTAL_TIME
+    delta_t = torch.ceil(t_phys / CONTROL_FREQ) * CONTROL_FREQ - t_phys
+    delta_t = torch.where(delta_t == 0, torch.tensor(CONTROL_FREQ, device=device), delta_t)
     
-    z_intent_max = torch.ones((num_test_samples, 2), device=device) 
+    # Target N levels to test budget (750 to 760)
+    cN_test = 750.0 + torch.rand(num_test_samples, device=device) * 10.0
+    
+    # STOCHASTIC SAFE STATES for cx and cq
+    cx_safe_1 = gaussian_sample(1.0).clamp(0.1, 6.0)
+    cq_safe_1 = gaussian_sample(0.005).clamp(0.0, 0.01)
+    
+    z_intent = torch.ones((num_test_samples, 2), device=device) # Max Feed Intent
 
     with torch.no_grad():
-        s_norm_i = get_4d_state_norm(cx_test, cN_safe, cq_rand)
-        u_safe_i = safeguard(s_norm_i, z_intent_max).cpu().numpy()
+        s_phys_1 = torch.stack([cx_safe_1, cN_test, cq_safe_1, t_norm], dim=1)
+        u_safe_1 = safeguard(s_phys_1, z_intent).cpu().numpy()
 
-    i_violations = 0
+    g1_passes = 0
+    target_limit = N_LIMIT * 0.995 # 796 mg/L
     for i in range(num_test_samples):
-        shading = np.exp(-ALPHA * cx_test[i].item() * L)
-        # We test against 0.96 because training was at 0.95 (1% tolerance)
-        i_limit_phys = (I_CRIT / (shading + 1e-6)) * 0.96
-        i_phys = ((u_safe_i[i, 0] + 1.0) / 2.0) * I_MAX
-        
-        if i_phys > i_limit_phys + 1e-1:
-            i_violations += 1
-    
-    print(f"Result: {i_violations} Light violations (Fail Rate: {(i_violations/num_test_samples)*100:.2f}%)")
+        fn_phys = denorm_fn(u_safe_1[i, 1])
+        if (cN_test[i].item() + (fn_phys * delta_t[i].item())) < target_limit:
+            g1_passes += 1
+    print(f"Result: {g1_passes}/{num_test_samples} passed (20h state < {target_limit})")
 
-    # --- TEST B: NITROGEN BUDGET (N) ---
-    print(f"\n--- [TEST B] Nitrogen Budget Stress Test ({num_test_samples} samples) ---")
-    cx_safe = torch.full((num_test_samples,), 1.0, device=device) 
-    cN_test = torch.linspace(150.0, 170.0, num_test_samples, device=device)
+    # --- TEST 2: Bioproduct Ratio Constraint (g2) ---
+    print(f"\n--- [TEST 2] g2: Ratio Violation (I within 2% of I_min) ---")
+    cx_test_2 = 1.0 + torch.rand(num_test_samples, device=device) * 5.0
+    cq_violating = cx_test_2 * RATIO_LIMIT * 0.99 # Violation point
+    
+    # STOCHASTIC SAFE STATE for cN
+    cN_safe_2 = gaussian_sample(100.0).clamp(0.0, 200.0)
+    t_zero = torch.zeros(num_test_samples, device=device)
     
     with torch.no_grad():
-        s_norm_n = get_4d_state_norm(cx_safe, cN_test, cq_rand)
-        u_safe_n = safeguard(s_norm_n, z_intent_max).cpu().numpy()
+        s_phys_2 = torch.stack([cx_test_2, cN_safe_2, cq_violating, t_zero], dim=1)
+        u_safe_2 = safeguard(s_phys_2, z_intent).cpu().numpy()
 
-    n_violations = 0
+    g2_passes = 0
+    i_pass_threshold = I_MIN + (I_MIN * 0.02) # 122.4
     for i in range(num_test_samples):
-        current_cN = cN_test[i].item()
-        fn_phys = ((u_safe_n[i, 1] + 1.0) / 2.0) * FN_MAX
-        
-        # Predicted next state must be below 96% threshold
-        if (current_cN + fn_phys) > (180.0 * 0.96):
-            n_violations += 1
+        i_phys = denorm_i(u_safe_2[i, 0])
+        if i_phys <= i_pass_threshold:
+            g2_passes += 1
+    print(f"Result: {g2_passes}/{num_test_samples} passed (I <= {i_pass_threshold:.2f})")
 
-    print(f"Result: {n_violations} Nitrogen violations (Fail Rate: {(n_violations/num_test_samples)*100:.2f}%)")
+    # --- TEST 3: Identity Mapping (Safe Region) ---
+    print(f"\n--- [TEST 3] Identity Mapping: Stochastic Safe Zone (Diff <= 1%) ---")
     
-    # --- TEST C: IDENTITY MAPPING CHECK (0.1% Threshold) ---
-    print(f"\n--- [TEST C] Identity Mapping Test ({num_test_samples} samples) ---")
-    cx_safe = torch.rand(num_test_samples, device=device) * 2.0
-    cN_safe = torch.rand(num_test_samples, device=device) * 50.0
+    # Gaussian sampling for ALL states
+    cx_safe_3 = gaussian_sample(2.0).clamp(0.1, 6.0)
+    cN_safe_3 = gaussian_sample(50.0).clamp(0.0, 150.0)
+    cq_safe_3 = gaussian_sample(0.005).clamp(0.0, 0.01)
+    t_safe_3 = gaussian_sample(0.2).clamp(0.0, 1.0)
     
-    z_intent_safe = -0.8 + torch.rand((num_test_samples, 2), device=device) * 0.3
+    z_safe_intent = -0.5 + torch.rand((num_test_samples, 2), device=device) * 1.0
 
     with torch.no_grad():
-        s_norm = get_4d_state_norm(cx_safe, cN_safe, cq_rand)
-        u_safe_out = safeguard(s_norm, z_intent_safe)
-
-    diff = torch.abs(u_safe_out - z_intent_safe)
-    rel_diff = diff / (torch.abs(z_intent_safe) + 1e-8)
+        s_safe = torch.stack([cx_safe_3, cN_safe_3, cq_safe_3, t_safe_3], dim=1)
+        u_safe_3 = safeguard(s_safe, z_safe_intent)
     
-    identity_violations = torch.sum(rel_diff > 0.001).item()
-    max_val_diff = torch.max(diff).item()
+    diff = torch.abs(u_safe_3 - z_safe_intent)
+    identity_passes = torch.all(diff <= 0.02, dim=1).sum().item()
+    max_dev = diff.max().item()
 
-    print(f"Max Absolute Deviation: {max_val_diff:.6f}")
-    print(f"Result: {identity_violations} Identity violations > 0.1%")
-
-    if i_violations == 0 and n_violations == 0 and identity_violations == 0:
-        print("\n🚀 SUCCESS: Static Normalization + Residual logic passed all tests.")
-    else:
-        print("\n⚠️ WARNING: Minor violations remain. Consider increasing safety_loss weight.")
+    print(f"Max Absolute Deviation: {max_dev:.6e}")
+    print(f"Result: {identity_passes}/{num_test_samples} points within 1% tolerance.")
 
 if __name__ == "__main__":
     run_synchronized_stress_test()
