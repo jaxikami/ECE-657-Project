@@ -80,8 +80,8 @@ class PhycocyaninEnv:
         self.time_step_count = 0
         self.violation_count = 0
         
-        # Initial State: [1.0 g/L, 150 mg/L, 0.0 mg/L] [cite: 666]
-        self.state = np.array([1.0, 150.0, 0.0], dtype=np.float32)
+        # Initial State: [1.0 g/L, 150 mg/L, 0.0 mg/L]
+        self.state = np.array([1.0, 150.0, 0.0], dtype=np.float64)
         self.prev_action = np.zeros(2)
         
         # Metric Tracking
@@ -94,7 +94,7 @@ class PhycocyaninEnv:
         return self.get_state_norm()
 
     def get_state_norm(self):
-        norm_obs = np.zeros(4, dtype=np.float32)
+        norm_obs = np.zeros(4, dtype=np.float64)
         norm_obs[0] = self.state[0] / 6.0     
         norm_obs[1] = self.state[1] / 800.0   
         norm_obs[2] = self.state[2] / 0.2     

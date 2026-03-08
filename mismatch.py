@@ -65,7 +65,7 @@ def run_synchronized_stress_test(num_test_samples=5000):
     # --- TEST 2: Bioproduct Ratio Constraint (g2) ---
     print(f"\n--- [TEST 2] g2: Ratio Violation (I within 2% of I_min) ---")
     cx_test_2 = 1.0 + torch.rand(num_test_samples, device=device) * 5.0
-    cq_violating = cx_test_2 * RATIO_LIMIT * 0.99 # Violation point
+    cq_violating = cx_test_2 * RATIO_LIMIT * 1.01 # Violation point (cq/cx >= 0.011)
     
     # STOCHASTIC SAFE STATE for cN
     cN_safe_2 = gaussian_sample(100.0).clamp(0.0, 200.0)

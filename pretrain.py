@@ -33,7 +33,7 @@ class ActionProjectionNetwork(nn.Module):
         self.final_layer = nn.Linear(latent_dim, action_dim)
         
         # Initialize final layer near zero to encourage identity mapping initially
-        nn.init.uniform_(self.final_layer.weight, -1e-4, 1e-4)
+        nn.init.uniform_(self.final_layer.weight, -1e-2, 1e-2)
         nn.init.constant_(self.final_layer.bias, 0)
         self.elu = nn.ELU()
 
@@ -59,7 +59,7 @@ class ActionProjectionNetwork(nn.Module):
         delta = torch.relu(self.final_layer(x_combined))
         return nom_act_norm - delta
 
-def run_pretraining(epochs=40000, batch_size=65536, buffer_size=2000000, refresh_interval=100):
+def run_pretraining(epochs=50000, batch_size=65536, buffer_size=2000000, refresh_interval=100):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = ActionProjectionNetwork(state_dim=4).to(device)
     optimizer = optim.Adam(model.parameters(), lr=1e-3)
@@ -76,7 +76,7 @@ def run_pretraining(epochs=40000, batch_size=65536, buffer_size=2000000, refresh
     # --- PLATEAU EXIT SETUP ---
     best_moving_avg = float('inf')
     plateau_counter = 0
-    patience = 1000
+    patience = 5000
     window_size = 200
     improvement_threshold = 0.001 # 0.1% improvement
     
@@ -106,12 +106,12 @@ def run_pretraining(epochs=40000, batch_size=65536, buffer_size=2000000, refresh
                 is_safe = torch.all(torch.abs(b_a - b_y) < 1e-7, dim=1, keepdim=True)
 
                 # 1. Identity Penalty: Punished for deviating if already safe
-                identity_weight = 8.0 - (2.0 * (epoch / epochs))
-                loss_identity = identity_weight * torch.mean((pred_y - b_a)**2)
+                identity_weight = 10
+                loss_identity = torch.mean((pred_y - b_a)**2)
 
                 # 2. Safety Penalty: Punished for violating boundaries (g1, g2)
-                safety_weight = 10.0 + (30.0 * (epoch / epochs))
-                violation = torch.clamp(pred_y - b_y, min=0.0)
+                safety_weight = 100
+                violation = torch.clamp(pred_y - b_y, min=1e-6) 
                 loss_safety = torch.mean(safety_weight * (violation**2))
 
                 total_loss = torch.where(is_safe, loss_identity, loss_safety).mean()
@@ -130,8 +130,8 @@ def run_pretraining(epochs=40000, batch_size=65536, buffer_size=2000000, refresh
         scheduler.step()
 
         # --- PLATEAU LOGIC ---
-        if len(unbiased_history) >= window_size:
-            current_moving_avg = np.mean(unbiased_history[-window_size:])
+        if len(raw_history) >= window_size and epoch >= 10000:
+            current_moving_avg = np.mean(raw_history[-window_size:])
             
             # Check for at least 0.1% improvement over the best-ever moving average
             if current_moving_avg < best_moving_avg * (1 - improvement_threshold):
@@ -146,6 +146,7 @@ def run_pretraining(epochs=40000, batch_size=65536, buffer_size=2000000, refresh
 
         pbar.set_postfix({
             'MSE': f'{avg_unbiased:.2e}', 
+            'Total Loss': f'{raw_history[-1]:.2e}',
             'Patience': f'{plateau_counter}/{patience}',
             'Stable': f"{buffer_success_count}/{required_success_per_buffer}"
         })

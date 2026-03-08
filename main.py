@@ -2,19 +2,17 @@ import torch
 import numpy as np
 import os
 from tqdm import tqdm
-from env import PhotoProductionEnv
+from env import PhycocyaninEnv  # 1. Updated Class Name
 from lag_agent import NonResNet_Agent
 from res_net_agent import SPRL_Agent
 from utils import DataLogger, Plotter
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 
-# --- Hyperparameters remain the same ---
-STATE_DIM = 3
+# --- Hyperparameters Updated ---
+STATE_DIM = 4      # 2. Updated to 4 (cx, cN, cq, t_norm)
 ACTION_DIM = 2
-LATENT_DIM = 2
 MAX_EPISODES = 50000 
-MAX_STEPS = 200      
-UPDATE_TIMESTEP = 14400 
+UPDATE_TIMESTEP = 2000 # Adjusted for stability 
 K_EPOCHS = 40
 EPS_CLIP = 0.2
 GAMMA = 0.99
@@ -25,61 +23,49 @@ ENTROPY_COEFF = 0.05
 
 class Memory:
     def __init__(self):
-        self.states, self.actions, self.logprobs, self.rewards, self.is_terminals = [], [], [], [], []
+        # 3. Added raw_actions to store the pre-tanh/unsquashed samples for PPO evaluate()
+        self.states, self.actions, self.raw_actions, self.logprobs, self.rewards, self.is_terminals = [], [], [], [], [], []
     def clear(self):
-        del self.states[:], self.actions[:], self.logprobs[:], self.rewards[:], self.is_terminals[:]
+        del self.states[:], self.actions[:], self.raw_actions[:], self.logprobs[:], self.rewards[:], self.is_terminals[:]
 
 def train_agent(agent_name, agent, logger):
     print(f"\n--- Starting Training: {agent_name} ---")
-    env = PhotoProductionEnv(train_mode=True)
+    env = PhycocyaninEnv() # 4. Matches env.py
     memory = Memory()
-    scheduler = CosineAnnealingWarmRestarts(
-        agent.optimizer, 
-        T_0=5000, 
-        T_mult=2, 
-        eta_min=MIN_LR
-    )
-    time_step = 0
+    scheduler = CosineAnnealingWarmRestarts(agent.optimizer, T_0=5000, T_mult=2, eta_min=MIN_LR)
     
+    time_step = 0
     rewards_history = []
     best_moving_avg = -float('inf')
     plateau_counter = 0
     
-    # --- EARLY EXIT HYPERPARAMETERS ---
-    WINDOW_SIZE = 500            
-    PATIENCE = 1000             
-    IMPROVEMENT_THRESHOLD = 1e-3 
-    EARLY_EXIT_START = 10000    
+    # Early Exit Params
+    WINDOW_SIZE, PATIENCE, EARLY_EXIT_START = 500, 1000, 10000    
     
     pbar = tqdm(range(1, MAX_EPISODES + 1), desc=f"Training {agent_name}")
     for i_episode in pbar:
         state = env.reset()
-        
         current_ep_reward = 0
-        ep_prod, ep_saf, ep_smth, ep_bio = 0, 0, 0, 0
-        steps_taken = 0
         
-        for t in range(MAX_STEPS):
+        while True: # 5. Use while loop to respect env's 'done' signal
             time_step += 1
+            
+            # Select action
             if agent_name == "SPRL":
-                action, latent, log_prob = agent.select_action(state)
-                memory.actions.append(torch.tensor(latent))
+                # Returns: safe_action, log_prob, z_raw
+                action, log_prob, raw_act = agent.select_action(state)
             else:
-                action, log_prob = agent.select_action(state)
-                memory.actions.append(torch.tensor(action))
+                # Returns: action, log_prob, raw_action
+                action, log_prob, raw_act = agent.select_action(state)
             
             memory.states.append(torch.tensor(state))
+            memory.actions.append(torch.tensor(action))
+            memory.raw_actions.append(torch.tensor(raw_act))
             memory.logprobs.append(torch.tensor(log_prob))
             
             state, reward, done, info = env.step(action)
             
             current_ep_reward += reward
-            ep_prod += info['reward']['production']
-            ep_saf += info['penalties']['safety']
-            ep_smth += info['penalties']['smoothing']
-            ep_bio += info['penalties']['biomass_efficiency']
-            steps_taken += 1
-            
             memory.rewards.append(reward)
             memory.is_terminals.append(done)
             
@@ -93,75 +79,52 @@ def train_agent(agent_name, agent, logger):
         rewards_history.append(current_ep_reward)
         scheduler.step(i_episode)
         
-        # --- PLATEAU LOGIC IMPLEMENTATION ---
+        # --- Simplified Plateau Logic ---
         if i_episode >= EARLY_EXIT_START:
             recent_avg = np.mean(rewards_history[-WINDOW_SIZE:])
-            
-            if recent_avg > (best_moving_avg * (1 + IMPROVEMENT_THRESHOLD)):
+            if recent_avg > best_moving_avg:
                 best_moving_avg = recent_avg
                 plateau_counter = 0 
             else:
                 plateau_counter += 1
-            
-            if plateau_counter >= PATIENCE:
-                print(f"\n[Early Exit] {agent_name} reached a plateau at episode {i_episode}.")
-                break
+            if plateau_counter >= PATIENCE: break
 
-        if i_episode % 5 == 0:
+        if i_episode % 10 == 0:
             pbar.set_postfix({
-                "Total": f"{current_ep_reward:.2f}",
-                "Avg_Prod": f"{ep_prod/steps_taken:.3f}",
-                "Avg_Saf": f"{ep_saf/steps_taken:.3f}",
-                "Avg_Smth": f"{ep_smth/steps_taken:.3f}",
-                "Avg_Bio": f"{ep_bio/steps_taken:.3f}",
-                "Plat": f"{plateau_counter}/{PATIENCE}",
-                "LR": f"{agent.optimizer.param_groups[0]['lr']:.3e}"
+                "Reward": f"{current_ep_reward:.1f}",
+                "Vio": f"{info['violation_count']}",
+                "LR": f"{agent.optimizer.param_groups[0]['lr']:.1e}"
             })
 
-    # Save weights after training completes or early exit triggers
-    save_path = f"{agent_name}_final_weights.pth"
-    torch.save(agent.policy.state_dict(), save_path)
-    print(f"Successfully saved weights to {save_path}")
-
-    # --- SAVE PLOT IMMEDIATELY ---
-    # Call the updated Plotter method with the specific agent name
+    torch.save(agent.policy.state_dict(), f"{agent_name}_final_weights.pth")
     Plotter.plot_training_results(logger.training_log, agent_name=agent_name)
 
-def evaluate_agent(agent_name, agent, logger, eval_episodes=100):
-    """Loads weights from .pth file and runs deterministic evaluation."""
+def evaluate_agent(agent_name, agent, logger, eval_episodes=10):
     print(f"\n--- Evaluating: {agent_name} ---")
-    
-    # --- LOAD WEIGHTS BEFORE EVALUATION ---
     load_path = f"{agent_name}_final_weights.pth"
     if os.path.exists(load_path):
         agent.policy.load_state_dict(torch.load(load_path))
         agent.policy.eval()
-        print(f"Loaded trained weights from {load_path}")
-    else:
-        print(f"Warning: No weights found at {load_path}. Evaluating untrained model.")
 
-    env = PhotoProductionEnv(train_mode=False)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    env = PhycocyaninEnv()
     all_states, all_actions, all_rewards, all_infos = [], [], [], []
     
-    pbar = tqdm(range(eval_episodes), desc=f"Eval {agent_name}")
-    
-    for _ in pbar:
+    for _ in range(eval_episodes):
         state = env.reset()
         ep_states, ep_actions, ep_rewards, ep_infos = [], [], [], []
         
-        for t in range(MAX_STEPS):
+        while True:
+            # Deterministic Action Selection
             with torch.no_grad():
-                state_t = torch.FloatTensor(state).to(device)
+                state_t = torch.FloatTensor(state).to(torch.device("cuda" if torch.cuda.is_available() else "cpu")).unsqueeze(0)
                 if agent_name == "SPRL":
-                    z = agent.policy.actor_latent_mean(agent.policy.actor_base(state_t))
-                    s_norm = (state_t.unsqueeze(0) - agent.s_mean) / (agent.s_std + 1e-8)
-                    z_norm = (z.unsqueeze(0) - agent.a_mean) / (agent.a_std + 1e-8)
-                    action_norm = agent.safeguard(s_norm, z_norm)
-                    action = (action_norm * (agent.a_std + 1e-8)) + agent.a_mean
-                    action = action.cpu().numpy().flatten()
+                    # Intent z from actor
+                    z = torch.tanh(agent.policy.actor(state_t))
+                    # Safeguard projection (using physical units)
+                    phys_scale = torch.tensor([6.0, 800.0, 0.1, 1.0], device=state_t.device)
+                    action = agent.safeguard(state_t * phys_scale, z).cpu().numpy().flatten()
                 else:
-                    action = agent.policy.actor(state_t).cpu().numpy().flatten()
+                    action = torch.tanh(agent.policy.actor(state_t)).cpu().numpy().flatten()
             
             next_state, reward, done, info = env.step(action)
             ep_states.append(state)
@@ -171,40 +134,23 @@ def evaluate_agent(agent_name, agent, logger, eval_episodes=100):
             state = next_state
             if done: break
         
-        total_ep_reward = sum(ep_rewards)
-        last_info = ep_infos[-1]
-        
-        pbar.set_postfix({
-            "Total": f"{total_ep_reward:.3f}",
-            "Prod": f"{last_info['reward']['production']:.3f}",
-            "Saf": f"{last_info['penalties']['safety']:.3f}"
-        })
-            
-        # Store the last evaluated trajectory for plotting
+        # Store last trajectory for Plotter
         all_states, all_actions, all_rewards, all_infos = ep_states, ep_actions, ep_rewards, ep_infos
 
-    logger.log_evaluation_trajectory(agent_name, all_states, all_actions, all_rewards, all_infos)
+    for i in all_infos: i["is_safe"] = 1 if i["violation_count"] == 0 else 0
     
-    # --- SAVE PLOT IMMEDIATELY ---
+    logger.log_evaluation_trajectory(agent_name, all_states, all_actions, all_rewards, all_infos)
     Plotter.plot_evaluation_trajectories(logger.eval_data, agent_name=agent_name)
 
 if __name__ == "__main__":
     logger = DataLogger()
-    
-    # Initialize Agents
     lag_agent = NonResNet_Agent(STATE_DIM, ACTION_DIM, LR_ACTOR, LR_CRITIC, GAMMA, K_EPOCHS, EPS_CLIP)
-    sprl_agent = SPRL_Agent(STATE_DIM, ACTION_DIM, LR_ACTOR, LR_CRITIC, GAMMA, K_EPOCHS, EPS_CLIP, ENTROPY_COEFF, LATENT_DIM)
+    sprl_agent = SPRL_Agent(STATE_DIM, ACTION_DIM, LR_ACTOR, LR_CRITIC, GAMMA, K_EPOCHS, EPS_CLIP, ENTROPY_COEFF)
     
-    # --- TRAINING PHASE ---
-    # Training functions now automatically save plots for each agent immediately upon completion.
-    train_active = False
-    if train_active:
-        train_agent("NonResNet", lag_agent, logger)
+    # Training
+    train_agent("NonResNet", lag_agent, logger)
     train_agent("SPRL", sprl_agent, logger)
         
-    # --- EVALUATION PHASE ---
-    # Evaluation functions now automatically save trajectory plots for each agent after testing.
+    # Evaluation
     evaluate_agent("NonResNet", lag_agent, logger)
     evaluate_agent("SPRL", sprl_agent, logger)
-    
-    print("\nAll training and evaluation runs are complete. Plots have been saved to the local directory.")
