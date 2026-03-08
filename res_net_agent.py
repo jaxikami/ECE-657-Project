@@ -28,7 +28,7 @@ class ActionProjectionNetwork(nn.Module):
         self.final_layer = nn.Linear(latent_dim, action_dim)
         self.elu = nn.ELU()
 
-    def forward(self, state_phys, nom_act_norm):
+    def forward(self, state_phys, nom_act_norm, apply_override=True):
         # 1. Internal Static Normalization matching Pretrain
         state_norm = (state_phys / self.max_vals) * 2.0 - 1.0
         
@@ -40,6 +40,9 @@ class ActionProjectionNetwork(nn.Module):
         # 2. Residual Correction
         delta = torch.relu(self.final_layer(x_combined))
         u_nn = nom_act_norm - delta
+        
+        if not apply_override:
+            return u_nn
         
         # 3. Explicit Analytical Override for G2 (Instantaneous)
         cx = state_phys[:, 0]

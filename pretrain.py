@@ -37,11 +37,12 @@ class ActionProjectionNetwork(nn.Module):
         nn.init.constant_(self.final_layer.bias, 0)
         self.elu = nn.ELU()
 
-    def forward(self, state_phys, nom_act_norm):
+    def forward(self, state_phys, nom_act_norm, apply_override=True):
         """
         Args:
             state_phys: Raw physical states [batch, 4]
             nom_act_norm: Normalized nominal actions [-1, 1]
+            apply_override: If True, applies the explicit analytical G2 protection override.
         """
         # 1. Integrated Static Normalization
         state_norm = (state_phys / self.max_vals) * 2.0 - 1.0
@@ -57,6 +58,9 @@ class ActionProjectionNetwork(nn.Module):
         # ReLU ensures we only move the action in the safety-correction direction
         delta = torch.relu(self.final_layer(x_combined))
         u_nn = nom_act_norm - delta
+        
+        if not apply_override:
+            return u_nn
         
         # 5. Explicit Analytical Override for G2 (Instantaneous)
         cx = state_phys[:, 0]
@@ -82,7 +86,7 @@ def run_pretraining(epochs=50000, batch_size=65536, buffer_size=2000000, refresh
     raw_history = []      
     unbiased_history = [] 
     early_stop_threshold = 5e-6
-    required_success_per_buffer = 50
+    required_success_per_buffer = 90
     buffer_success_count = 0
     
     # --- PLATEAU EXIT SETUP ---
@@ -112,7 +116,7 @@ def run_pretraining(epochs=50000, batch_size=65536, buffer_size=2000000, refresh
 
             optimizer.zero_grad()
             with autocast(device_type='cuda'):
-                pred_y = model(b_s, b_a)
+                pred_y = model(b_s, b_a, apply_override=False)
                 
                 # Check if the original intent was already safe
                 is_safe = torch.all(torch.abs(b_a - b_y) < 1e-7, dim=1, keepdim=True)
@@ -168,27 +172,36 @@ def run_pretraining(epochs=50000, batch_size=65536, buffer_size=2000000, refresh
             print(f"\n[Success] Safety Manifold Converged (MSE threshold) at epoch {epoch}")
             break
         
-        if plateau_counter >= patience:
+        if epoch >= 5000 and plateau_counter >= patience:
             print(f"\n[Plateau] No 0.1% improvement for {patience} epochs. Terminating.")
             break
 
     torch.save(model.state_dict(), "action_projection_network.pth")
     
     plt.figure(figsize=(10, 6))
-    plt.plot(raw_history, label='Total Weighted Loss', alpha=0.5)
     
     if len(raw_history) >= window_size:
-        moving_avg = np.convolve(raw_history, np.ones(window_size)/window_size, mode='valid')
-        plt.plot(range(window_size - 1, len(raw_history)), moving_avg, color='red', label=f'{window_size}-Epoch Moving Average')
+        # Calculate moving averages
+        moving_avg_raw = np.convolve(raw_history, np.ones(window_size)/window_size, mode='valid')
+        moving_avg_mse = np.convolve(unbiased_history, np.ones(window_size)/window_size, mode='valid')
+        
+        # Plot only the moving averages
+        epochs_range = range(window_size - 1, len(raw_history))
+        plt.plot(epochs_range, moving_avg_raw, color='blue', label=f'Total Loss ({window_size}-Epoch MA)')
+        plt.plot(epochs_range, moving_avg_mse, color='red', label=f'Unbiased MSE ({window_size}-Epoch MA)')
+    else:
+        # Fallback if training ended extremely early
+        plt.plot(raw_history, color='blue', label='Total Weighted Loss')
+        plt.plot(unbiased_history, color='red', label='Unbiased MSE')
 
     plt.yscale('log')
     plt.xlabel("Epochs")
     plt.ylabel("Loss")
-    plt.title("Safeguard Convergence: Combined Identity & Safety Optimization")
+    plt.title("Safeguard Convergence: 200-Epoch Moving Averages")
     plt.grid(True, which="both", linestyle="--", alpha=0.5)
     plt.legend()
     plt.savefig("manifold_convergence.png")
-    plt.show()
+    plt.close() # Close figure instead of show() to avoid blocking if run unsupervised
 
 if __name__ == "__main__":
     run_pretraining()
