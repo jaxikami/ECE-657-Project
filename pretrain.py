@@ -53,18 +53,30 @@ class ActionProjectionNetwork(nn.Module):
         # 3. Skip Connection (Residual Connection) for efficiency
         x_res = self.res_block1(x_proj)
         x_combined = self.elu(x_res + x_proj) # Global skip connection
-        
         # 4. Final Residual Projection (u = z - delta)
         # ReLU ensures we only move the action in the safety-correction direction
         delta = torch.relu(self.final_layer(x_combined))
-        return nom_act_norm - delta
+        u_nn = nom_act_norm - delta
+        
+        # 5. Explicit Analytical Override for G2 (Instantaneous)
+        cx = state_phys[:, 0]
+        cq = state_phys[:, 2]
+        
+        # 0.011 is the RATIO_LIMIT, 0.98 is the SAFE_BUFFER from data_gen
+        g2_violation = cq > (cx * 0.011 * 0.98)
+        
+        u_safe = u_nn.clone()
+        # Force Light Intent (idx 0) to maximum physical limit (+1.0 in normalized space)
+        u_safe[:, 0] = torch.where(g2_violation, torch.full_like(u_safe[:, 0], 1.0), u_nn[:, 0])
+        
+        return u_safe
 
 def run_pretraining(epochs=50000, batch_size=65536, buffer_size=2000000, refresh_interval=100):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = ActionProjectionNetwork(state_dim=4).to(device)
     optimizer = optim.Adam(model.parameters(), lr=1e-3)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-        optimizer, T_0=refresh_interval, T_mult=1, eta_min=1e-5
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=500, min_lr=1e-5
     )
 
     raw_history = []      
@@ -127,7 +139,7 @@ def run_pretraining(epochs=50000, batch_size=65536, buffer_size=2000000, refresh
         avg_unbiased = epoch_unbiased_loss / (buffer_size / batch_size)
         raw_history.append(epoch_raw_loss / (buffer_size / batch_size))
         unbiased_history.append(avg_unbiased)
-        scheduler.step()
+        scheduler.step(raw_history[-1])
 
         # --- PLATEAU LOGIC ---
         if len(raw_history) >= window_size and epoch >= 10000:
@@ -164,11 +176,17 @@ def run_pretraining(epochs=50000, batch_size=65536, buffer_size=2000000, refresh
     
     plt.figure(figsize=(10, 6))
     plt.plot(raw_history, label='Total Weighted Loss', alpha=0.5)
+    
+    if len(raw_history) >= window_size:
+        moving_avg = np.convolve(raw_history, np.ones(window_size)/window_size, mode='valid')
+        plt.plot(range(window_size - 1, len(raw_history)), moving_avg, color='red', label=f'{window_size}-Epoch Moving Average')
+
     plt.yscale('log')
     plt.xlabel("Epochs")
     plt.ylabel("Loss")
     plt.title("Safeguard Convergence: Combined Identity & Safety Optimization")
     plt.grid(True, which="both", linestyle="--", alpha=0.5)
+    plt.legend()
     plt.savefig("manifold_convergence.png")
     plt.show()
 

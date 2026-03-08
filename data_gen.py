@@ -49,13 +49,12 @@ def get_fresh_batch_dataset(num_samples=450000, bias=0.5, device='cuda'):
     fn_safe_phys = torch.clamp(fn_budget, min=0.0, max=FN_MAX)
     fn_target_phys = torch.minimum(fn_phys, fn_safe_phys)
 
-    # --- g2: Ratio Constraint Trigger ---
-    # Triggered when current bioproduct ratio exceeds 98% of the limit
-    ratio_threshold = cx * RATIO_LIMIT * SAFE_BUFFER
-    ratio_violation = cq > ratio_threshold
-    
-    # Target behavior: If violating ratio, drop Light (I) to the minimum (120)
-    i_target_phys = torch.where(ratio_violation, torch.full_like(i_phys, I_MIN), i_phys)
+    # --- g2: Ratio Constraint Trigger (Removed) ---
+    # We no longer force the Safeguard to drop Light to I_MIN.
+    # The physical kinetics show that dropping to I_MIN actually worsens the ratio!
+    # By leaving Light unchanged here, the RL Agent will naturally learn to balance 
+    # the Tradeoff correctly using its environmental reward signal.
+    i_target_phys = i_phys
 
     # 6. Re-normalize Target Actions back to [-1, 1]
     # Normalization matches the full absolute physical range

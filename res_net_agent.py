@@ -37,10 +37,23 @@ class ActionProjectionNetwork(nn.Module):
         
         x_res = self.res_block1(x_proj)
         x_combined = self.elu(x_res + x_proj)
-        
         # 2. Residual Correction
         delta = torch.relu(self.final_layer(x_combined))
-        return nom_act_norm - delta
+        u_nn = nom_act_norm - delta
+        
+        # 3. Explicit Analytical Override for G2 (Instantaneous)
+        cx = state_phys[:, 0]
+        cq = state_phys[:, 2]
+        
+        # 0.011 is the RATIO_LIMIT, 0.98 is the SAFE_BUFFER from data_gen
+        g2_violation = cq > (cx * 0.011 * 0.98)
+        
+        u_safe = u_nn.clone()
+        # Force Light Intent (idx 0) to maximum physical limit (+1.0 in normalized space)
+        # This differentiable operation ensures perfect gradients for the PPO actor mapping penalty.
+        u_safe[:, 0] = torch.where(g2_violation, torch.full_like(u_safe[:, 0], 1.0), u_nn[:, 0])
+        
+        return u_safe
 
 class ActorCritic(nn.Module):
     """

@@ -63,25 +63,30 @@ def run_synchronized_stress_test(num_test_samples=5000):
     print(f"Result: {g1_passes}/{num_test_samples} passed (20h state < {target_limit})")
 
     # --- TEST 2: Bioproduct Ratio Constraint (g2) ---
-    print(f"\n--- [TEST 2] g2: Ratio Violation (I within 2% of I_min) ---")
+    print(f"\n--- [TEST 2] g2: Analytical Override Verification ---")
     cx_test_2 = 1.0 + torch.rand(num_test_samples, device=device) * 5.0
-    cq_violating = cx_test_2 * RATIO_LIMIT * 1.01 # Violation point (cq/cx >= 0.011)
+    cq_violating = cx_test_2 * RATIO_LIMIT * 1.5 # Massive violation
     
     # STOCHASTIC SAFE STATE for cN
     cN_safe_2 = gaussian_sample(100.0).clamp(0.0, 200.0)
     t_zero = torch.zeros(num_test_samples, device=device)
     
+    # Agent intent: Wants to drop Light to minimum (-1.0)
+    # The safeguard MUST override this bad intent and force it to maximum (1.0)
+    z_intent_2 = torch.zeros((num_test_samples, 2), device=device)
+    z_intent_2[:, 0] = -1.0 
+    
     with torch.no_grad():
         s_phys_2 = torch.stack([cx_test_2, cN_safe_2, cq_violating, t_zero], dim=1)
-        u_safe_2 = safeguard(s_phys_2, z_intent).cpu().numpy()
+        u_safe_2 = safeguard(s_phys_2, z_intent_2).cpu()
 
+    # We want to verify that the safeguard SEIZED control of the agent's Light (idx 0)
+    # and forced it to 1.0 (I_MAX)
     g2_passes = 0
-    i_pass_threshold = I_MIN + (I_MIN * 0.02) # 122.4
-    for i in range(num_test_samples):
-        i_phys = denorm_i(u_safe_2[i, 0])
-        if i_phys <= i_pass_threshold:
-            g2_passes += 1
-    print(f"Result: {g2_passes}/{num_test_samples} passed (I <= {i_pass_threshold:.2f})")
+    diff_i = torch.abs(u_safe_2[:, 0] - 1.0)
+    g2_passes = torch.sum(diff_i <= 1e-4).item()
+    
+    print(f"Result: {g2_passes}/{num_test_samples} passed (Safeguard analytically overrides Light to I_MAX)")
 
     # --- TEST 3: Identity Mapping (Safe Region) ---
     print(f"\n--- [TEST 3] Identity Mapping: Stochastic Safe Zone (Diff <= 1%) ---")

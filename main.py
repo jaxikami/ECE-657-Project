@@ -6,12 +6,12 @@ from env import PhycocyaninEnv  # 1. Updated Class Name
 from lag_agent import NonResNet_Agent
 from res_net_agent import SPRL_Agent
 from utils import DataLogger, Plotter
-from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+from torch.optim.lr_scheduler import LinearLR
 
 # --- Hyperparameters Updated ---
 STATE_DIM = 4      # 2. Updated to 4 (cx, cN, cq, t_norm)
 ACTION_DIM = 2
-MAX_EPISODES = 50000 
+MAX_EPISODES = 100000 
 UPDATE_TIMESTEP = 2000 # Adjusted for stability 
 K_EPOCHS = 40
 EPS_CLIP = 0.2
@@ -32,7 +32,7 @@ def train_agent(agent_name, agent, logger):
     print(f"\n--- Starting Training: {agent_name} ---")
     env = PhycocyaninEnv() # 4. Matches env.py
     memory = Memory()
-    scheduler = CosineAnnealingWarmRestarts(agent.optimizer, T_0=5000, T_mult=2, eta_min=MIN_LR)
+    scheduler = LinearLR(agent.optimizer, start_factor=1.0, end_factor=0.01, total_iters=MAX_EPISODES)
     
     time_step = 0
     rewards_history = []
@@ -40,7 +40,7 @@ def train_agent(agent_name, agent, logger):
     plateau_counter = 0
     
     # Early Exit Params
-    WINDOW_SIZE, PATIENCE, EARLY_EXIT_START = 500, 1000, 10000    
+    WINDOW_SIZE, PATIENCE, EARLY_EXIT_START = 500, 1000, 25000    
     
     pbar = tqdm(range(1, MAX_EPISODES + 1), desc=f"Training {agent_name}")
     for i_episode in pbar:
@@ -58,10 +58,10 @@ def train_agent(agent_name, agent, logger):
                 # Returns: action, log_prob, raw_action
                 action, log_prob, raw_act = agent.select_action(state)
             
-            memory.states.append(torch.tensor(state))
-            memory.actions.append(torch.tensor(action))
-            memory.raw_actions.append(torch.tensor(raw_act))
-            memory.logprobs.append(torch.tensor(log_prob))
+            memory.states.append(torch.tensor(state, dtype=torch.float32))
+            memory.actions.append(torch.tensor(action, dtype=torch.float32))
+            memory.raw_actions.append(torch.tensor(raw_act, dtype=torch.float32))
+            memory.logprobs.append(torch.tensor(log_prob, dtype=torch.float32))
             
             state, reward, done, info = env.step(action)
             
@@ -75,9 +75,9 @@ def train_agent(agent_name, agent, logger):
                 time_step = 0
             if done: break
             
-        logger.log_training_episode(agent_name, current_ep_reward)
+        logger.log_training_episode(agent_name, current_ep_reward, info["violation_count"])
         rewards_history.append(current_ep_reward)
-        scheduler.step(i_episode)
+        scheduler.step()
         
         # --- Simplified Plateau Logic ---
         if i_episode >= EARLY_EXIT_START:
@@ -91,7 +91,12 @@ def train_agent(agent_name, agent, logger):
 
         if i_episode % 10 == 0:
             pbar.set_postfix({
-                "Reward": f"{current_ep_reward:.1f}",
+                "AvgR": f"{info['avg_reward']:.3f}",
+                "G1P": f"{info['avg_g1_penalty']:.3f}",
+                "G2P": f"{info['avg_g2_penalty']:.3f}",
+                "G3P": f"{info['avg_g3_penalty']:.3f}",
+                "SmP": f"{info['avg_smooth_penalty']:.3f}",
+                "NUsP": f"{info['avg_nitrate_usage_penalty']:.3f}",
                 "Vio": f"{info['violation_count']}",
                 "LR": f"{agent.optimizer.param_groups[0]['lr']:.1e}"
             })
@@ -99,7 +104,7 @@ def train_agent(agent_name, agent, logger):
     torch.save(agent.policy.state_dict(), f"{agent_name}_final_weights.pth")
     Plotter.plot_training_results(logger.training_log, agent_name=agent_name)
 
-def evaluate_agent(agent_name, agent, logger, eval_episodes=10):
+def evaluate_agent(agent_name, agent, logger, eval_episodes=1000):
     print(f"\n--- Evaluating: {agent_name} ---")
     load_path = f"{agent_name}_final_weights.pth"
     if os.path.exists(load_path):
@@ -108,6 +113,7 @@ def evaluate_agent(agent_name, agent, logger, eval_episodes=10):
 
     env = PhycocyaninEnv()
     all_states, all_actions, all_rewards, all_infos = [], [], [], []
+    total_g1, total_g2, total_g3 = 0, 0, 0
     
     for _ in range(eval_episodes):
         state = env.reset()
@@ -136,6 +142,22 @@ def evaluate_agent(agent_name, agent, logger, eval_episodes=10):
         
         # Store last trajectory for Plotter
         all_states, all_actions, all_rewards, all_infos = ep_states, ep_actions, ep_rewards, ep_infos
+        
+        # Log episode violations
+        if len(ep_infos) > 0:
+            last_info = ep_infos[-1]
+            logger.log_evaluation_episode_violations(
+                agent_name, 
+                last_info["violation_count"],
+                last_info.get("g1_violation_count", 0),
+                last_info.get("g2_violation_count", 0),
+                last_info.get("g3_violation_count", 0)
+            )
+            total_g1 += last_info.get("g1_violation_count", 0)
+            total_g2 += last_info.get("g2_violation_count", 0)
+            total_g3 += last_info.get("g3_violation_count", 0)
+
+    print(f"{agent_name} Evaluation Violations - G1 (Path Nitrate): {total_g1}, G2 (Ratio): {total_g2}, G3 (Terminal Nitrate): {total_g3}")
 
     for i in all_infos: i["is_safe"] = 1 if i["violation_count"] == 0 else 0
     
@@ -154,3 +176,6 @@ if __name__ == "__main__":
     # Evaluation
     evaluate_agent("NonResNet", lag_agent, logger)
     evaluate_agent("SPRL", sprl_agent, logger)
+    
+    # Plot Violations Comparison
+    Plotter.plot_violations(logger)

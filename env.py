@@ -79,6 +79,9 @@ class PhycocyaninEnv:
         self.time = 0.0
         self.time_step_count = 0
         self.violation_count = 0
+        self.g1_violation_count = 0
+        self.g2_violation_count = 0
+        self.g3_violation_count = 0
         
         # Initial State: [1.0 g/L, 150 mg/L, 0.0 mg/L]
         self.state = np.array([1.0, 150.0, 0.0], dtype=np.float64)
@@ -86,10 +89,14 @@ class PhycocyaninEnv:
         
         # Metric Tracking
         self.ep_total_reward = 0.0
+        self.ep_rewards = []
         self.ep_prod_rewards = []
         self.ep_smooth_penalties = []
         self.ep_n_usage_penalties = []
         self.ep_violation_penalties = []
+        self.ep_g1_penalties = []
+        self.ep_g2_penalties = []
+        self.ep_g3_penalties = []
         
         return self.get_state_norm()
 
@@ -110,64 +117,94 @@ class PhycocyaninEnv:
         self.state = integrate_rk4(self.state, I_phys, Fn_phys, self.dt, self.n_inner_steps)
         self.time += self.control_freq
         self.time_step_count += 1
-        
+        minor_coef = 2
+        severe_coef = 20
         # --- Penalties and Rewards ---
         # g1: Path Nitrate violation penalty
         n_vio_p = 0.0
-        if self.state[1] > self.N_LIMIT_PATH:
-            severity = (self.state[1] - self.N_LIMIT_PATH) / self.N_LIMIT_PATH
-            n_vio_p = 20.0 * severity
+        n_ratio = self.state[1] / self.N_LIMIT_PATH
+        # Reverse log barrier approaching infinity as n_ratio -> 1, centered near 0.995
+        if n_ratio > 0.9 and n_ratio < 1.0:
+            # Shift ratio such that evaluating at 0.995 gives log(1 - 0.99) roughly
+            n_vio_p -= minor_coef * np.log(1.005 - n_ratio) 
+        if n_ratio > 1.0:
+            n_vio_p += severe_coef * (n_ratio - 1.0) 
             self.violation_count += 1
+            self.g1_violation_count += 1
             
         # g2: Ratio violation penalty
         q_vio_p = 0.0
         ratio = self.state[2] / (self.state[0] + 1e-8)
+        q_ratio = ratio / self.RATIO_LIMIT
+        if q_ratio > 0.9 and q_ratio < 1.0:
+            q_vio_p -= minor_coef * np.log(1.005 - q_ratio)
         if ratio > self.RATIO_LIMIT:
-            severity = (ratio - self.RATIO_LIMIT) / self.RATIO_LIMIT
-            q_vio_p = 20.0 * severity
+            q_vio_p += severe_coef * (q_ratio - 1.0)
             self.violation_count += 1
+            self.g2_violation_count += 1
             
-        # Smoothing [cite: 674]
+        # Smoothing
         smooth_p = 0.05 * np.mean(np.square(a_clipped - self.prev_action))
         self.prev_action = a_clipped.copy()
         
         # Nitrate usage (encourages metabolism efficiency)
-        n_use_p = 0.01 * Fn_phys
+        n_use_p = 0.005 * Fn_phys
         
-        # Production Reward [cite: 671]
-        prod_r = self.state[2] * 40.0 
+        # Production Reward
+        prod_r = self.state[2] * 10
         
         total_v_p = n_vio_p + q_vio_p
         step_reward = prod_r - (total_v_p + smooth_p + n_use_p)
         
         # Update metrics
         self.ep_total_reward += step_reward
+        self.ep_rewards.append(step_reward)
         self.ep_prod_rewards.append(prod_r)
         self.ep_smooth_penalties.append(smooth_p)
         self.ep_n_usage_penalties.append(n_use_p)
         self.ep_violation_penalties.append(total_v_p)
+        self.ep_g1_penalties.append(n_vio_p)
+        self.ep_g2_penalties.append(q_vio_p)
+        self.ep_g3_penalties.append(0.0)
         
         # --- Termination & Terminal Penalty ---
         done = self.time_step_count >= self.max_steps
         if done:
             # g3: Terminal Nitrate check [cite: 691]
-            if self.state[1] > self.N_LIMIT_TERM:
-                t_severity = (self.state[1] - self.N_LIMIT_TERM) / self.N_LIMIT_TERM
-                t_penalty = 150.0 * t_severity
+            t_ratio = self.state[1] / self.N_LIMIT_TERM
+            t_penalty = 0.0
+            
+            if t_ratio > 0.9 and t_ratio < 1.0:
+                t_penalty -= minor_coef * np.log(1.005 - t_ratio) * 100
+                
+            if t_ratio > 1.0:
+                t_penalty += severe_coef * (t_ratio - 1.0) * 100
+                self.violation_count += 1
+                self.g3_violation_count += 1
+            else:
+                self.ep_total_reward += 50.0 # Success bonus
+                
+            if t_penalty > 0:
                 step_reward -= t_penalty
                 self.ep_total_reward -= t_penalty
                 self.ep_violation_penalties[-1] += t_penalty
-                self.violation_count += 1
-            else:
-                self.ep_total_reward += 50.0 # Success bonus
+                self.ep_g3_penalties[-1] += t_penalty
+                self.ep_rewards[-1] -= t_penalty
 
         info = {
+            "avg_reward": float(np.mean(self.ep_rewards)),
             "total_reward": self.ep_total_reward,
-            "avg_prod_reward": np.mean(self.ep_prod_rewards),
-            "avg_smooth_penalty": np.mean(self.ep_smooth_penalties),
-            "avg_nitrate_usage_penalty": np.mean(self.ep_n_usage_penalties),
-            "avg_violation_penalty": np.mean(self.ep_violation_penalties),
-            "violation_count": self.violation_count
+            "avg_prod_reward": float(np.mean(self.ep_prod_rewards)),
+            "avg_smooth_penalty": float(np.mean(self.ep_smooth_penalties)),
+            "avg_nitrate_usage_penalty": float(np.mean(self.ep_n_usage_penalties)),
+            "avg_violation_penalty": float(np.mean(self.ep_violation_penalties)),
+            "avg_g1_penalty": float(np.mean(self.ep_g1_penalties)),
+            "avg_g2_penalty": float(np.mean(self.ep_g2_penalties)),
+            "avg_g3_penalty": float(np.mean(self.ep_g3_penalties)),
+            "violation_count": self.violation_count,
+            "g1_violation_count": self.g1_violation_count,
+            "g2_violation_count": self.g2_violation_count,
+            "g3_violation_count": self.g3_violation_count
         }
         
         return self.get_state_norm(), step_reward, done, info
