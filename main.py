@@ -20,7 +20,7 @@ LR_ACTOR = 3e-4
 LR_CRITIC = 1e-3
 MIN_LR = 1e-5 
 ENTROPY_COEFF = 0.05
-EVALUATE_ONLY = True  # Set to False to run the 100k episode training loop
+EVALUATE_ONLY = False  # Set to False to run the 100k episode training loop
 NOISE_STD = 0.05
 
 class Memory:

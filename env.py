@@ -132,9 +132,9 @@ class PhycocyaninEnv:
         n_vio_p = 0.0
         n_ratio = self.state[1] / self.N_LIMIT_PATH
         # Reverse log barrier approaching infinity as n_ratio -> 1, centered near 0.995
-        if n_ratio > 0.9 and n_ratio < 1.0:
-            # Shift ratio such that evaluating at 0.995 gives log(1 - 0.99) roughly
-            n_vio_p -= minor_coef * np.log(1.005 - n_ratio) 
+        # if n_ratio > 0.9 and n_ratio < 1.0:
+        #     # Shift ratio such that evaluating at 0.995 gives log(1 - 0.99) roughly
+        #     n_vio_p -= minor_coef * np.log(1.005 - n_ratio) 
         if n_ratio > 1.0:
             n_vio_p += severe_coef * (n_ratio - 1.0) 
             self.violation_count += 1
@@ -144,8 +144,8 @@ class PhycocyaninEnv:
         q_vio_p = 0.0
         ratio = self.state[2] / (self.state[0] + 1e-8)
         q_ratio = ratio / self.RATIO_LIMIT
-        if q_ratio > 0.9 and q_ratio < 1.0:
-            q_vio_p -= minor_coef * np.log(1.005 - q_ratio)
+        # if q_ratio > 0.9 and q_ratio < 1.0:
+        #     q_vio_p -= minor_coef * np.log(1.005 - q_ratio)
         if ratio > self.RATIO_LIMIT:
             q_vio_p += severe_coef * (q_ratio - 1.0)
             self.violation_count += 1
@@ -182,8 +182,8 @@ class PhycocyaninEnv:
             t_ratio = self.state[1] / self.N_LIMIT_TERM
             t_penalty = 0.0
             
-            if t_ratio > 0.9 and t_ratio < 1.0:
-                t_penalty -= minor_coef * np.log(1.005 - t_ratio) * 100
+            # if t_ratio > 0.9 and t_ratio < 1.0:
+            #     t_penalty -= minor_coef * np.log(1.005 - t_ratio) * 100
                 
             if t_ratio > 1.0:
                 t_penalty += severe_coef * (t_ratio - 1.0) * 100
