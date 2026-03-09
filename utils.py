@@ -45,10 +45,11 @@ class Plotter:
         # Scale y-axis based on the moving average to ignore extreme raw outliers
         valid_mv_avg = mv_avg.dropna()
         if len(valid_mv_avg) > 0:
-            y_min, y_max = valid_mv_avg.min(), valid_mv_avg.max()
+            y_max = valid_mv_avg.max()
+            y_min = -2.0 # Fixed lower bound as requested
             y_range = y_max - y_min
-            # Add a 10% buffer on top and bottom of the moving average range
-            plt.ylim(y_min - 0.1 * y_range, y_max + 0.1 * y_range)
+            # Add a 10% buffer on top, keep bottom at -2
+            plt.ylim(y_min, y_max + 0.1 * y_range)
             
         plt.title(f"Training Convergence: {agent_name}")
         plt.xlabel("Episodes")

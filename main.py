@@ -11,8 +11,8 @@ from torch.optim.lr_scheduler import LinearLR
 # --- Hyperparameters Updated ---
 STATE_DIM = 4      # 2. Updated to 4 (cx, cN, cq, t_norm)
 ACTION_DIM = 2
-MAX_EPISODES = 100000 
-UPDATE_TIMESTEP = 2000 # Adjusted for stability 
+MAX_EPISODES = 50000 
+UPDATE_TIMESTEP = 1000 # Adjusted for stability 
 K_EPOCHS = 40
 EPS_CLIP = 0.2
 GAMMA = 0.99
@@ -42,7 +42,7 @@ def train_agent(agent_name, agent, logger):
     plateau_counter = 0
     
     # Early Exit Params
-    WINDOW_SIZE, PATIENCE, EARLY_EXIT_START = 500, 1000, 25000    
+    WINDOW_SIZE, PATIENCE, EARLY_EXIT_START = 100, 1000, 10000    
     
     pbar = tqdm(range(1, MAX_EPISODES + 1), desc=f"Training {agent_name}")
     for i_episode in pbar:
