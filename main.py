@@ -20,7 +20,7 @@ LR_ACTOR = 3e-4
 LR_CRITIC = 1e-3
 MIN_LR = 1e-5 
 ENTROPY_COEFF = 0.05
-EVALUATE_ONLY = False  # Set to False to run the 100k episode training loop
+EVALUATE_ONLY = True  # Set to False to run the 100k episode training loop
 NOISE_STD = 0.05
 
 class Memory:
@@ -42,7 +42,7 @@ def train_agent(agent_name, agent, logger):
     plateau_counter = 0
     
     # Early Exit Params
-    WINDOW_SIZE, PATIENCE, EARLY_EXIT_START = 100, 1000, 10000    
+    WINDOW_SIZE, PATIENCE, EARLY_EXIT_START = 150, 1500, 15000    
     
     pbar = tqdm(range(1, MAX_EPISODES + 1), desc=f"Training {agent_name}")
     for i_episode in pbar:
@@ -72,11 +72,11 @@ def train_agent(agent_name, agent, logger):
             memory.is_terminals.append(done)
             
             if time_step % UPDATE_TIMESTEP == 0:
-                agent.learn(memory)
-                scheduler.step()
+                agent.learn(memory)                
                 memory.clear()
                 time_step = 0
             if done: break
+        scheduler.step()
         logger.log_training_episode(agent_name, current_ep_reward, info["violation_count"])
         rewards_history.append(current_ep_reward)
         

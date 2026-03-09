@@ -58,20 +58,34 @@ class ActionProjectionNetwork(nn.Module):
         # ReLU ensures we only move the action in the safety-correction direction
         delta = torch.relu(self.final_layer(x_combined))
         u_nn = nom_act_norm - delta
+        # 5. Explicit Analytical Override for G3 (Terminal Nitrate)
+        cN = state_phys[:, 1]
+        t_norm = state_phys[:, 3]
         
-        if not apply_override:
-            return u_nn
+        TOTAL_TIME = 240.0
+        CONTROL_INTERVAL = 20.0
+        N_LIMIT_TERM = 150.0
+        FN_MAX = 40.0
         
-        # 5. Explicit Analytical Override for G2 (Instantaneous)
-        cx = state_phys[:, 0]
-        cq = state_phys[:, 2]
+        t_phys = t_norm * TOTAL_TIME
+        time_remaining = TOTAL_TIME - t_phys
         
-        # 0.011 is the RATIO_LIMIT, 0.98 is the SAFE_BUFFER from data_gen
-        g2_violation = cq > (cx * 0.011 * 0.98)
+        near_end = time_remaining <= CONTROL_INTERVAL
+        safe_time_remaining = torch.clamp(time_remaining, min=1.0)
+        
+        # Denormalize NN intended feed to physical
+        fn_nn_phys = ((u_nn[:, 1] + 1.0) / 2.0) * FN_MAX
+        
+        # Calculate exactly how much MAXIMUM feed we can provide to hit 150 * 0.95
+        fn_max_term = (N_LIMIT_TERM * 0.98 - cN) / safe_time_remaining
+        u_max_term = ((fn_max_term / FN_MAX) * 2.0) - 1.0
+        
+        # Ensure we don't violate absolute action space boundaries
+        u_max_term = torch.clamp(u_max_term, min=-1.0, max=1.0)
         
         u_safe = u_nn.clone()
-        # Force Light Intent (idx 0) to maximum physical limit (+1.0 in normalized space)
-        u_safe[:, 0] = torch.where(g2_violation, torch.full_like(u_safe[:, 0], 1.0), u_nn[:, 0])
+        # Directly cap the neural network's feed action at the maximum allowed safe boundary
+        u_safe[:, 1] = torch.where(near_end, torch.minimum(u_nn[:, 1], u_max_term), u_nn[:, 1])
         
         return u_safe
 
@@ -85,7 +99,7 @@ def run_pretraining(epochs=50000, batch_size=65536, buffer_size=2000000, refresh
 
     raw_history = []      
     unbiased_history = [] 
-    early_stop_threshold = 5e-6
+    early_stop_threshold = 2e-4
     required_success_per_buffer = 90
     buffer_success_count = 0
     
@@ -102,7 +116,7 @@ def run_pretraining(epochs=50000, batch_size=65536, buffer_size=2000000, refresh
     for epoch in pbar:
         if epoch % refresh_interval == 0:
             buffer_success_count = 0
-            # Fetch fresh batch with 10h budget logic
+            # Fetch fresh batch with 20h budget logic
             s_raw, a_norm, y_target = get_fresh_batch_dataset(buffer_size, bias=0.5)
 
         model.train()
@@ -125,7 +139,7 @@ def run_pretraining(epochs=50000, batch_size=65536, buffer_size=2000000, refresh
                 identity_weight = 10
                 loss_identity = torch.mean((pred_y - b_a)**2)
 
-                # 2. Safety Penalty: Punished for violating boundaries (g1, g2)
+                # 2. Safety Penalty: Punished for violating boundaries (g1)
                 safety_weight = 100
                 violation = torch.clamp(pred_y - b_y, min=1e-6) 
                 loss_safety = torch.mean(safety_weight * (violation**2))
@@ -146,7 +160,7 @@ def run_pretraining(epochs=50000, batch_size=65536, buffer_size=2000000, refresh
         scheduler.step(raw_history[-1])
 
         # --- PLATEAU LOGIC ---
-        if len(raw_history) >= window_size and epoch >= 10000:
+        if len(raw_history) >= window_size and epoch >= 7000:
             current_moving_avg = np.mean(raw_history[-window_size:])
             
             # Check for at least 0.1% improvement over the best-ever moving average

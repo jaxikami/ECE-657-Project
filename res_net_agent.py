@@ -41,20 +41,33 @@ class ActionProjectionNetwork(nn.Module):
         delta = torch.relu(self.final_layer(x_combined))
         u_nn = nom_act_norm - delta
         
-        if not apply_override:
-            return u_nn
+        # 3. Explicit Analytical Override for G3 (Terminal Nitrate)
+        cN = state_phys[:, 1]
+        t_norm = state_phys[:, 3]
         
-        # 3. Explicit Analytical Override for G2 (Instantaneous)
-        cx = state_phys[:, 0]
-        cq = state_phys[:, 2]
+        TOTAL_TIME = 240.0
+        CONTROL_INTERVAL = 20.0
+        N_LIMIT_TERM = 150.0
+        FN_MAX = 40.0
         
-        # 0.011 is the RATIO_LIMIT, 0.98 is the SAFE_BUFFER from data_gen
-        g2_violation = cq > (cx * 0.011 * 0.98)
+        t_phys = t_norm * TOTAL_TIME
+        time_remaining = TOTAL_TIME - t_phys
+        
+        near_end = time_remaining <= CONTROL_INTERVAL
+        safe_time_remaining = torch.clamp(time_remaining, min=1.0)
+        
+        # Calculate exactly how much MAXIMUM feed we can provide to hit 150 * 0.95
+        fn_max_term = (N_LIMIT_TERM * 0.95 - cN) / safe_time_remaining
+        u_max_term = ((fn_max_term / FN_MAX) * 2.0) - 1.0
+        
+        # Ensure we don't violate absolute action space boundaries
+        u_max_term = torch.clamp(u_max_term, min=-1.0, max=1.0)
         
         u_safe = u_nn.clone()
-        # Force Light Intent (idx 0) to maximum physical limit (+1.0 in normalized space)
-        # This differentiable operation ensures perfect gradients for the PPO actor mapping penalty.
-        u_safe[:, 0] = torch.where(g2_violation, torch.full_like(u_safe[:, 0], 1.0), u_nn[:, 0])
+        # Cap the neural network's feed action at the maximum allowed safe boundary
+        # This operation is fully differentiable out-of-the-box (gradients route to the chosen min argument),
+        # preserving the mapping penalty pathway for the PPO actor.
+        u_safe[:, 1] = torch.where(near_end, torch.minimum(u_nn[:, 1], u_max_term), u_nn[:, 1])
         
         return u_safe
 
@@ -197,7 +210,7 @@ class SPRL_Agent:
             loss = ppo_loss + \
                    0.5 * self.MseLoss(state_values.squeeze(), rewards) - \
                    self.entropy_coeff * dist_entropy.mean() + \
-                   0.1 * mapping_penalty # Coefficient for safety alignment
+                   0.01 * mapping_penalty # Coefficient for safety alignment (reduced from 0.1)
 
             self.optimizer.zero_grad()
             loss.backward()

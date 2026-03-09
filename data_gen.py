@@ -23,11 +23,9 @@ def get_fresh_batch_dataset(num_samples=450000, bias=0.5, device='cuda'):
     cN_boundary = 750.0 + torch.rand(n_high, device=device) * 50.0
     cN = torch.cat([cN_uniform, cN_boundary])
     
-    # Bioproduct (cq): Focused sampling near the 0.011 ratio limit
-    cq_low = torch.rand(n_low, device=device) * (cx[:n_low] * RATIO_LIMIT)
-    cq_high = (0.9 + torch.rand(n_high, device=device) * 0.6) * (cx[n_low:] * RATIO_LIMIT)
-    cq = torch.cat([cq_low, cq_high])
-
+    # Bioproduct (cq): Uniformly sample across its range (no focus on ratio limits anymore)
+    cq = torch.rand(num_samples, device=device) * 0.1
+    
     # t_norm: Normalized Time (0 to 1) for finite horizon
     t_norm = torch.rand(num_samples, device=device)
 
@@ -42,15 +40,42 @@ def get_fresh_batch_dataset(num_samples=450000, bias=0.5, device='cuda'):
     
     # 5. Apply Constraints to Determine Target Actions
     
-    # --- g1: Nitrate Path Constraint (10h Accumulation) ---
-    # Ensures current_N + (Fn * 10h) <= 800 * 0.98
+    # --- g1: Nitrate Path Constraint (20h Accumulation) ---
+    # Ensures current_N + (Fn * 20h) <= 800 * 0.98
     n_max_allowed = N_LIMIT_PATH * SAFE_BUFFER
     fn_budget = (n_max_allowed - cN) / CONTROL_INTERVAL
     fn_safe_phys = torch.clamp(fn_budget, min=0.0, max=FN_MAX)
     fn_target_phys = torch.minimum(fn_phys, fn_safe_phys)
 
-    # --- g2: Ratio Constraint Trigger (Removed) ---
-    # We no longer force the Safeguard to drop Light to I_MIN.
+    # --- g3: Terminal Nitrate Constraint (End of Episode limit < 150) ---
+    TOTAL_TIME = 240.0
+    N_LIMIT_TERM = 150.0
+    # Calculate time remaining in episode
+    t_phys = t_norm * TOTAL_TIME
+    time_remaining = TOTAL_TIME - t_phys
+    
+    # We only care about g3 if we are approaching the end of the episode
+    # E.g. within the last control interval (20h)
+    near_end = time_remaining <= CONTROL_INTERVAL
+    
+    # Required MAXIMUM feed to avoid exceeding 150 * 0.95 (safety buffer matching env.py) at the absolute end
+    # Assuming some small baseline consumption, but primarily we just need to ensure current + feed * time <= limit
+    # fn * time_remaining <= N_LIMIT_TERM * 0.95 - cN
+    # fn <= (150 * 0.95 - cN) / time_remaining
+    # To prevent div by 0 at the exact end, clamp time_remaining from below
+    safe_time_remaining = torch.clamp(time_remaining, min=1.0)
+    
+    fn_max_term = (N_LIMIT_TERM * 0.95 - cN) / safe_time_remaining
+    fn_max_term = torch.clamp(fn_max_term, min=0.0)
+    
+    # If we are near the end, our TARGET feed must be AT MOST the allowed amount to avoid g3 violation
+    fn_target_phys = torch.where(
+        near_end,
+        torch.minimum(fn_max_term, fn_target_phys),
+        fn_target_phys
+    )
+    
+    # We no longer force the Safeguard to drop Light to I_MIN for g2.
     # The physical kinetics show that dropping to I_MIN actually worsens the ratio!
     # By leaving Light unchanged here, the RL Agent will naturally learn to balance 
     # the Tradeoff correctly using its environmental reward signal.

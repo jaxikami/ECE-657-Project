@@ -62,31 +62,43 @@ def run_synchronized_stress_test(num_test_samples=5000):
             g1_passes += 1
     print(f"Result: {g1_passes}/{num_test_samples} passed (20h state < {target_limit})")
 
-    # --- TEST 2: Bioproduct Ratio Constraint (g2) ---
-    print(f"\n--- [TEST 2] g2: Analytical Override Verification ---")
-    cx_test_2 = 1.0 + torch.rand(num_test_samples, device=device) * 5.0
-    cq_violating = cx_test_2 * RATIO_LIMIT * 1.5 # Massive violation
+    # --- TEST 2: Terminal Nitrate Constraint (g3) ---
+    N_LIMIT_TERM = 150.0
+    print(f"\n--- [TEST 2] g3: Terminal Nitrate Protection (Target < {N_LIMIT_TERM}) ---")
     
-    # STOCHASTIC SAFE STATE for cN
-    cN_safe_2 = gaussian_sample(100.0).clamp(0.0, 200.0)
-    t_zero = torch.zeros(num_test_samples, device=device)
+    # Generate states very close to the end of the episode (e.g. last 1-2 hours)
+    t_norm_terminal = 0.9 + torch.rand(num_test_samples, device=device) * 0.05
+    t_phys_term = t_norm_terminal * TOTAL_TIME
+    delta_t_term = TOTAL_TIME - t_phys_term # Time remaining until terminal check
     
-    # Agent intent: Wants to drop Light to minimum (-1.0)
-    # The safeguard MUST override this bad intent and force it to maximum (1.0)
-    z_intent_2 = torch.zeros((num_test_samples, 2), device=device)
-    z_intent_2[:, 0] = -1.0 
+    # Generate Nitrate levels dangerously close to the 142.5 limit, but ensure it's mathematically possible to satisfy
+    # by keeping starting levels strictly <= 142.5 (since we cannot have negative feed)
+    cN_test_3 = (N_LIMIT_TERM * 0.98) - torch.rand(num_test_samples, device=device) * 5.0
+    
+    # STOCHASTIC SAFE STATES for cx and cq
+    cx_safe_3 = gaussian_sample(2.0).clamp(0.1, 6.0)
+    cq_safe_3 = gaussian_sample(0.005).clamp(0.0, 0.01)
+    
+    # Agent intent: Wants to minimize growth (Min Light) and provide MAX Nitrate Feed (1.0)
+    # This greedy behavior would normally accumulate Nitrate above the 150 limit.
+    z_intent_3 = torch.zeros((num_test_samples, 2), device=device)
+    z_intent_3[:, 0] = -1.0 
+    z_intent_3[:, 1] = 1.0 
     
     with torch.no_grad():
-        s_phys_2 = torch.stack([cx_test_2, cN_safe_2, cq_violating, t_zero], dim=1)
-        u_safe_2 = safeguard(s_phys_2, z_intent_2).cpu()
+        s_phys_3 = torch.stack([cx_safe_3, cN_test_3, cq_safe_3, t_norm_terminal], dim=1)
+        u_safe_3 = safeguard(s_phys_3, z_intent_3).cpu().numpy()
 
-    # We want to verify that the safeguard SEIZED control of the agent's Light (idx 0)
-    # and forced it to 1.0 (I_MAX)
-    g2_passes = 0
-    diff_i = torch.abs(u_safe_2[:, 0] - 1.0)
-    g2_passes = torch.sum(diff_i <= 1e-4).item()
-    
-    print(f"Result: {g2_passes}/{num_test_samples} passed (Safeguard analytically overrides Light to I_MAX)")
+    # Verify that the safeguard forced the Nitrate Feed to be low enough
+    g3_passes = 0
+    target_limit_term = N_LIMIT_TERM * 0.98
+    for i in range(num_test_samples):
+        fn_phys = denorm_fn(u_safe_3[i, 1])
+        # Simple heuristic check: the added feed over the remaining time should keep us below the limit
+        if (cN_test_3[i].item() + (fn_phys * delta_t_term[i].item())) <= target_limit_term:
+            g3_passes += 1
+            
+    print(f"Result: {g3_passes}/{num_test_samples} passed (Terminal state projected < {target_limit_term})")
 
     # --- TEST 3: Identity Mapping (Safe Region) ---
     print(f"\n--- [TEST 3] Identity Mapping: Stochastic Safe Zone (Diff <= 1%) ---")

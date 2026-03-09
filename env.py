@@ -60,7 +60,7 @@ class PhycocyaninEnv:
         # --- Batch Config  ---
         self.total_time = 240.0        
         self.control_freq = 20.0       
-        self.max_steps = int(self.total_time / self.control_freq) # 12
+        self.max_steps = int(self.total_time / self.control_freq) # 12 steps of 20h
         
         # --- Limits [cite: 679, 687, 691, 694, 695] ---
         self.I_MIN, self.I_MAX = 120.0, 400.0 
@@ -71,7 +71,7 @@ class PhycocyaninEnv:
         
         # --- Integration Config ---
         self.dt = 10.0 / 60.0          # 10 minutes (0.1667 h)
-        self.n_inner_steps = int(self.control_freq / self.dt) # 72 steps
+        self.n_inner_steps = int(self.control_freq / self.dt) # 120 steps for 20h
 
         self.reset()
 
@@ -125,16 +125,16 @@ class PhycocyaninEnv:
         self.state = integrate_rk4(self.state, I_phys, Fn_phys, self.dt, self.n_inner_steps)
         self.time += self.control_freq
         self.time_step_count += 1
-        minor_coef = 2
+        minor_coef = 0 if getattr(self, 'is_training', False) else 2
         severe_coef = 200
         # --- Penalties and Rewards ---
         # g1: Path Nitrate violation penalty
         n_vio_p = 0.0
         n_ratio = self.state[1] / self.N_LIMIT_PATH
-        # Reverse log barrier approaching infinity as n_ratio -> 1, centered near 0.995
-        if n_ratio > 0.995 and n_ratio < 1.0:
-            # Shift ratio such that evaluating at 0.995 gives log(1 - 0.99) roughly
-            n_vio_p -= minor_coef * np.log(1.005 - n_ratio) 
+        # Reverse log barrier approaching infinity as n_ratio -> 1, centered near 0.95
+        if n_ratio > 0.95 and n_ratio < 1.0:
+            # Shift ratio such that evaluating at 0.95 gives roughly log(1.0) = 0
+            n_vio_p -= minor_coef * np.log(1.05 - n_ratio) 
         if n_ratio > 1.0:
             n_vio_p += severe_coef * (n_ratio - 1.0) 
             self.violation_count += 1
@@ -144,8 +144,8 @@ class PhycocyaninEnv:
         q_vio_p = 0.0
         ratio = self.state[2] / (self.state[0] + 1e-8)
         q_ratio = ratio / self.RATIO_LIMIT
-        if q_ratio > 0.995 and q_ratio < 1.0:
-            q_vio_p -= minor_coef * np.log(1.005 - q_ratio)
+        if q_ratio > 0.95 and q_ratio < 1.0:
+            q_vio_p -= minor_coef * np.log(1.05 - q_ratio)
         if ratio > self.RATIO_LIMIT:
             q_vio_p += severe_coef * (q_ratio - 1.0)
             self.violation_count += 1
@@ -182,8 +182,8 @@ class PhycocyaninEnv:
             t_ratio = self.state[1] / self.N_LIMIT_TERM
             t_penalty = 0.0
             
-            if t_ratio > 0.995 and t_ratio < 1.0:
-                t_penalty -= minor_coef * np.log(1.005 - t_ratio) * 100
+            if t_ratio > 0.95 and t_ratio < 1.0:
+                t_penalty -= minor_coef * np.log(1.05 - t_ratio) * 100
                 
             if t_ratio > 1.0:
                 t_penalty += severe_coef * (t_ratio - 1.0) * 100
