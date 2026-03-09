@@ -149,10 +149,14 @@ class SPRL_Agent:
             phys_scale = torch.tensor([6.0, 800.0, 0.1, 1.0], device=device)
             state_phys = state_t * phys_scale
             
-            # 3. Project to Safety
+            # We compute u_safe to see what the safeguard WOULD do, but we DO NOT return it.
+            # During training, the environment MUST execute what the Actor chose (z) so the Actor 
+            # can learn from environmental penalties (G1/G2). The loss function will separately 
+            # penalize the Actor for differing from the Safeguard.
             u_safe = self.safeguard(state_phys, z)
             
-        return u_safe.cpu().numpy().flatten(), log_prob.cpu().numpy(), z_raw.cpu().numpy().flatten()
+        # Return the Actor's Intent (z) so the environment executes what the Actor actually wanted!
+        return z.cpu().numpy().flatten(), log_prob.cpu().numpy(), z_raw.cpu().numpy().flatten()
 
     def learn(self, memory):
         rewards = []

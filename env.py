@@ -75,7 +75,7 @@ class PhycocyaninEnv:
 
         self.reset()
 
-    def reset(self):
+    def reset(self, randomize=False):
         self.time = 0.0
         self.time_step_count = 0
         self.violation_count = 0
@@ -83,8 +83,16 @@ class PhycocyaninEnv:
         self.g2_violation_count = 0
         self.g3_violation_count = 0
         
-        # Initial State: [1.0 g/L, 150 mg/L, 0.0 mg/L]
+        # Initial State Base: [1.0 g/L, 150 mg/L, 0.0 mg/L]
         self.state = np.array([1.0, 150.0, 0.0], dtype=np.float64)
+        
+        # Add Initial State Randomization for Robustness Evaluation
+        if randomize:
+            # Vary Biomass between 0.8 and 1.2 g/L
+            self.state[0] = np.random.uniform(0.8, 1.2)
+            # Vary initial Nitrate between 100.0 and 200.0 mg/L
+            self.state[1] = np.random.uniform(100.0, 200.0)
+            
         self.prev_action = np.zeros(2)
         
         # Metric Tracking

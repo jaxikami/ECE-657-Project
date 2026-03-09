@@ -59,32 +59,39 @@ class Plotter:
         plt.close()
 
     @staticmethod
-    def plot_violations(logger):
+    def plot_training_violations(logger):
         agents = ["NonResNet", "SPRL"]
-        
         train_viols = []
-        eval_viols = []
+        
         for agent in agents:
             t_viol = sum(logger.training_violations.get(agent, []))
             train_viols.append(t_viol)
             
-            e_viol = sum(logger.eval_violations.get(agent, []))
-            eval_viols.append(e_viol)
-            
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
-        
+        fig, ax1 = plt.subplots(figsize=(6, 5))
         ax1.bar(agents, train_viols, color=['tab:blue', 'tab:orange'])
         ax1.set_title("Total Training Violations")
         ax1.set_ylabel("Number of Violations")
         ax1.grid(True, axis='y', linestyle='--', alpha=0.7)
+        plt.tight_layout()
+        plt.savefig("training_violations.png")
+        plt.close()
         
+    @staticmethod
+    def plot_evaluation_violations(logger, noise_level):
+        agents = ["NonResNet", "SPRL"]
+        eval_viols = []
+        
+        for agent in agents:
+            e_viol = sum(logger.eval_violations.get(agent, []))
+            eval_viols.append(e_viol)
+            
+        fig, ax2 = plt.subplots(figsize=(6, 5))
         ax2.bar(agents, eval_viols, color=['tab:blue', 'tab:orange'])
-        ax2.set_title("Evaluation Violations (Last Trajectory)")
+        ax2.set_title(f"Total Evaluation Violations (1000 noisy eps @ {noise_level})")
         ax2.set_ylabel("Number of Violations")
         ax2.grid(True, axis='y', linestyle='--', alpha=0.7)
-        
         plt.tight_layout()
-        plt.savefig("violations_comparison.png")
+        plt.savefig("evaluation_violations.png")
         plt.close()
 
     @staticmethod

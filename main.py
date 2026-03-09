@@ -20,6 +20,8 @@ LR_ACTOR = 3e-4
 LR_CRITIC = 1e-3
 MIN_LR = 1e-5 
 ENTROPY_COEFF = 0.05
+EVALUATE_ONLY = True  # Set to False to run the 100k episode training loop
+NOISE_STD = 0.05
 
 class Memory:
     def __init__(self):
@@ -71,13 +73,12 @@ def train_agent(agent_name, agent, logger):
             
             if time_step % UPDATE_TIMESTEP == 0:
                 agent.learn(memory)
+                scheduler.step()
                 memory.clear()
                 time_step = 0
             if done: break
-            
         logger.log_training_episode(agent_name, current_ep_reward, info["violation_count"])
         rewards_history.append(current_ep_reward)
-        scheduler.step()
         
         # --- Simplified Plateau Logic ---
         if i_episode >= EARLY_EXIT_START:
@@ -104,8 +105,8 @@ def train_agent(agent_name, agent, logger):
     torch.save(agent.policy.state_dict(), f"{agent_name}_final_weights.pth")
     Plotter.plot_training_results(logger.training_log, agent_name=agent_name)
 
-def evaluate_agent(agent_name, agent, logger, eval_episodes=1000):
-    print(f"\n--- Evaluating: {agent_name} ---")
+def evaluate_agent(agent_name, agent, logger, eval_episodes=5000, noise_std=0.05):
+    print(f"\n--- Evaluating: {agent_name} with Randomized Initial State + N(0, {noise_std}) Intent Noise ---")
     load_path = f"{agent_name}_final_weights.pth"
     if os.path.exists(load_path):
         agent.policy.load_state_dict(torch.load(load_path))
@@ -116,22 +117,34 @@ def evaluate_agent(agent_name, agent, logger, eval_episodes=1000):
     total_g1, total_g2, total_g3 = 0, 0, 0
     
     for _ in range(eval_episodes):
-        state = env.reset()
+        # 1. Base reset with standard normal variance
+        state = env.reset(randomize=True)
+        
         ep_states, ep_actions, ep_rewards, ep_infos = [], [], [], []
         
         while True:
-            # Deterministic Action Selection
+            # Deterministic Intent Generation
             with torch.no_grad():
                 state_t = torch.FloatTensor(state).to(torch.device("cuda" if torch.cuda.is_available() else "cpu")).unsqueeze(0)
-                if agent_name == "SPRL":
-                    # Intent z from actor
-                    z = torch.tanh(agent.policy.actor(state_t))
-                    # Safeguard projection (using physical units)
-                    phys_scale = torch.tensor([6.0, 800.0, 0.1, 1.0], device=state_t.device)
-                    action = agent.safeguard(state_t * phys_scale, z).cpu().numpy().flatten()
-                else:
-                    action = torch.tanh(agent.policy.actor(state_t)).cpu().numpy().flatten()
+                intent = torch.tanh(agent.policy.actor(state_t)).cpu().numpy().flatten()
             
+            # Apply severe Gaussian variation (e.g. 20%) to the INTENT, simulating 
+            # actor confusion or controller imprecision
+            if noise_std > 0:
+                noise = np.random.normal(0, noise_std, size=intent.shape)
+                noisy_intent = np.clip(intent + noise, -1.0, 1.0)
+            else:
+                noisy_intent = intent
+                
+            # SPRL Safeguard Intercepts the Noisy Intent
+            with torch.no_grad():
+                if agent_name == "SPRL":
+                    noisy_intent_t = torch.FloatTensor(noisy_intent).to(state_t.device).unsqueeze(0)
+                    phys_scale = torch.tensor([6.0, 800.0, 0.1, 1.0], device=state_t.device)
+                    action = agent.safeguard(state_t * phys_scale, noisy_intent_t).cpu().numpy().flatten()
+                else:
+                    action = noisy_intent
+                
             next_state, reward, done, info = env.step(action)
             ep_states.append(state)
             ep_actions.append(action)
@@ -170,12 +183,16 @@ if __name__ == "__main__":
     sprl_agent = SPRL_Agent(STATE_DIM, ACTION_DIM, LR_ACTOR, LR_CRITIC, GAMMA, K_EPOCHS, EPS_CLIP, ENTROPY_COEFF)
     
     # Training
-    train_agent("NonResNet", lag_agent, logger)
-    train_agent("SPRL", sprl_agent, logger)
+    if not EVALUATE_ONLY:
+        train_agent("NonResNet", lag_agent, logger)
+        train_agent("SPRL", sprl_agent, logger)
         
-    # Evaluation
-    evaluate_agent("NonResNet", lag_agent, logger)
-    evaluate_agent("SPRL", sprl_agent, logger)
+    # Evaluation (with aggressive 20% intent noise)
+    evaluate_agent("NonResNet", lag_agent, logger, noise_std=NOISE_STD)
+    evaluate_agent("SPRL", sprl_agent, logger, noise_std=NOISE_STD)
     
-    # Plot Violations Comparison
-    Plotter.plot_violations(logger)
+    if not EVALUATE_ONLY:
+        Plotter.plot_training_violations(logger)
+        
+    # Plot Evaluation Violations
+    Plotter.plot_evaluation_violations(logger, noise_level=NOISE_STD)

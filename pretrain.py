@@ -92,7 +92,7 @@ def run_pretraining(epochs=50000, batch_size=65536, buffer_size=2000000, refresh
     # --- PLATEAU EXIT SETUP ---
     best_moving_avg = float('inf')
     plateau_counter = 0
-    patience = 5000
+    patience = 1000
     window_size = 200
     improvement_threshold = 0.001 # 0.1% improvement
     
@@ -178,28 +178,43 @@ def run_pretraining(epochs=50000, batch_size=65536, buffer_size=2000000, refresh
 
     torch.save(model.state_dict(), "action_projection_network.pth")
     
-    plt.figure(figsize=(10, 6))
+    fig, ax1 = plt.subplots(figsize=(10, 6))
+    ax2 = ax1.twinx()  # Create secondary axis
     
     if len(raw_history) >= window_size:
         # Calculate moving averages
         moving_avg_raw = np.convolve(raw_history, np.ones(window_size)/window_size, mode='valid')
         moving_avg_mse = np.convolve(unbiased_history, np.ones(window_size)/window_size, mode='valid')
-        
-        # Plot only the moving averages
         epochs_range = range(window_size - 1, len(raw_history))
-        plt.plot(epochs_range, moving_avg_raw, color='blue', label=f'Total Loss ({window_size}-Epoch MA)')
-        plt.plot(epochs_range, moving_avg_mse, color='red', label=f'Unbiased MSE ({window_size}-Epoch MA)')
+        
+        # Plot Total Loss on left axis (Blue)
+        line1 = ax1.plot(epochs_range, moving_avg_raw, color='blue', label=f'Total Loss ({window_size}-Ep MA)')
+        # Plot MSE on right axis (Red)
+        line2 = ax2.plot(epochs_range, moving_avg_mse, color='red', label=f'Unbiased MSE ({window_size}-Ep MA)')
+        
+        # Combine legends
+        lines = line1 + line2
+        labels = [l.get_label() for l in lines]
+        ax1.legend(lines, labels, loc='upper right')
     else:
         # Fallback if training ended extremely early
-        plt.plot(raw_history, color='blue', label='Total Weighted Loss')
-        plt.plot(unbiased_history, color='red', label='Unbiased MSE')
+        line1 = ax1.plot(raw_history, color='blue', label='Total Weighted Loss')
+        line2 = ax2.plot(unbiased_history, color='red', label='Unbiased MSE')
+        lines = line1 + line2
+        labels = [l.get_label() for l in lines]
+        ax1.legend(lines, labels, loc='upper right')
 
-    plt.yscale('log')
-    plt.xlabel("Epochs")
-    plt.ylabel("Loss")
+    ax1.set_xlabel("Epochs")
+    ax1.set_ylabel("Total Loss", color='blue')
+    ax2.set_ylabel("Unbiased MSE", color='red')
+    
+    # Use log scale for both axes as loss spans multiple orders of magnitude
+    ax1.set_yscale('log')
+    ax2.set_yscale('log')
+    
     plt.title("Safeguard Convergence: 200-Epoch Moving Averages")
-    plt.grid(True, which="both", linestyle="--", alpha=0.5)
-    plt.legend()
+    ax1.grid(True, which="both", linestyle="--", alpha=0.5)
+    plt.tight_layout()
     plt.savefig("manifold_convergence.png")
     plt.close() # Close figure instead of show() to avoid blocking if run unsupervised
 
