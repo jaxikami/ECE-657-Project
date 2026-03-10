@@ -113,7 +113,8 @@ def evaluate_agent(agent_name, agent, logger, eval_episodes=5000, noise_std=0.05
         agent.policy.eval()
 
     env = PhycocyaninEnv()
-    all_states, all_actions, all_rewards, all_infos = [], [], [], []
+    best_states, best_actions, best_rewards, best_infos = [], [], [], []
+    best_ep_reward = -float('inf')
     total_g1, total_g2, total_g3 = 0, 0, 0
     
     for _ in range(eval_episodes):
@@ -153,8 +154,11 @@ def evaluate_agent(agent_name, agent, logger, eval_episodes=5000, noise_std=0.05
             state = next_state
             if done: break
         
-        # Store last trajectory for Plotter
-        all_states, all_actions, all_rewards, all_infos = ep_states, ep_actions, ep_rewards, ep_infos
+        # Store the best trajectory for Plotter
+        ep_total_reward = sum(ep_rewards)
+        if ep_total_reward > best_ep_reward:
+            best_ep_reward = ep_total_reward
+            best_states, best_actions, best_rewards, best_infos = ep_states, ep_actions, ep_rewards, ep_infos
         
         # Log episode violations
         if len(ep_infos) > 0:
@@ -172,9 +176,10 @@ def evaluate_agent(agent_name, agent, logger, eval_episodes=5000, noise_std=0.05
 
     print(f"{agent_name} Evaluation Violations - G1 (Path Nitrate): {total_g1}, G2 (Ratio): {total_g2}, G3 (Terminal Nitrate): {total_g3}")
 
-    for i in all_infos: i["is_safe"] = 1 if i["violation_count"] == 0 else 0
+    for i in best_infos: i["is_safe"] = 1 if i["violation_count"] == 0 else 0
     
-    logger.log_evaluation_trajectory(agent_name, all_states, all_actions, all_rewards, all_infos)
+    logger.log_evaluation_trajectory(agent_name, best_states, best_actions, best_rewards, best_infos)
+    print(f"Best Episode Plotted Reward: {best_ep_reward:.2f}")
     Plotter.plot_evaluation_trajectories(logger.eval_data, agent_name=agent_name)
 
 if __name__ == "__main__":

@@ -145,7 +145,7 @@ class SPRL_Agent:
             self.safeguard.eval()
 
         self.MseLoss = nn.MSELoss()
-        self.mapping_criterion = nn.SmoothL1Loss(beta=0.01)
+        self.mapping_criterion = nn.SmoothL1Loss(beta=0.05)
 
     def select_action(self, state_norm):
         """
