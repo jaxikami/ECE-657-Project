@@ -162,7 +162,8 @@ class SPRL_Agent:
         
         # 2. Safeguard (Safety Filter) Network Initialization
         # Loaded identically and strictly set into evaluation mode to ensure 
-        # the weights remain completely frozen during the RL loop.        self.safeguard = ActionProjectionNetwork(state_dim=4, action_dim=2).to(device)
+        # the weights remain completely frozen during the RL loop.
+        self.safeguard = ActionProjectionNetwork(state_dim=4, action_dim=2).to(device)
         if os.path.exists("action_projection_network.pth"):
             self.safeguard.load_state_dict(torch.load("action_projection_network.pth", map_location=device))
             self.safeguard.eval()

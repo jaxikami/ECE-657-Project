@@ -23,8 +23,8 @@ LR_ACTOR = 3e-4        # Initial learning rate for the Actor network
 LR_CRITIC = 1e-3       # Initial learning rate for the Critic network
 MIN_LR = 1e-5          # Minimum learning rate bound for the linear scheduler
 ENTROPY_COEFF = 0.05   # Exploration coefficient for the SPRL agent
-EVALUATE_ONLY = False  # Set to False to run the full training loop before evaluation
-NOISE_STD = 0.05       # Standard deviation of the Gaussian noise applied to agent intent during evaluation
+EVALUATE_ONLY = True  # Set to False to run the full training loop before evaluation
+NOISE_STD = 0.05      # Standard deviation of the Gaussian noise applied to agent intent during evaluation
 
 class Memory:
     """
@@ -127,7 +127,7 @@ def train_agent(agent_name, agent, logger):
     torch.save(agent.policy.state_dict(), f"{agent_name}_final_weights.pth")
     Plotter.plot_training_results(logger.training_log, agent_name=agent_name)
 
-def evaluate_agent(agent_name, agent, logger, eval_episodes=5000, noise_std=0.05):
+def evaluate_agent(agent_name, agent, logger, eval_episodes=1000, noise_std=0.05):
     """
     Evaluates a trained agent's robustness against both initial state variations
     and continuous intent observation noise.
@@ -147,6 +147,10 @@ def evaluate_agent(agent_name, agent, logger, eval_episodes=5000, noise_std=0.05
     best_states, best_actions, best_rewards, best_infos = [], [], [], []
     best_ep_reward = -float('inf')
     total_g1, total_g2, total_g3 = 0, 0, 0
+    
+    # Aggregated metrics for plotting
+    all_nitrate_trajectories = []
+    all_production_trajectories = []
     
     for _ in range(eval_episodes):
         # The environment is reset with randomized initial conditions for robust evaluation.
@@ -186,14 +190,18 @@ def evaluate_agent(agent_name, agent, logger, eval_episodes=5000, noise_std=0.05
             ep_rewards.append(reward)
             ep_infos.append(info)
             state = next_state
-            if done: break
+            if done:
+                ep_states.append(state)
+                break
         
         # Best Trajectory Storage
-        # The episode achieving the highest total reward is retained for downstream visualization.
         ep_total_reward = sum(ep_rewards)
         if ep_total_reward > best_ep_reward:
             best_ep_reward = ep_total_reward
             best_states, best_actions, best_rewards, best_infos = ep_states, ep_actions, ep_rewards, ep_infos
+            
+        all_nitrate_trajectories.append([s[1] for s in ep_states])
+        all_production_trajectories.append([s[2] for s in ep_states])
         
         # Violation Archiving
         if len(ep_infos) > 0:
@@ -214,16 +222,24 @@ def evaluate_agent(agent_name, agent, logger, eval_episodes=5000, noise_std=0.05
     # Compilation and Visual Output
     for i in best_infos: i["is_safe"] = 1 if i["violation_count"] == 0 else 0
     
-    logger.log_evaluation_trajectory(agent_name, best_states, best_actions, best_rewards, best_infos)
+    # Calculate aggregation statistics
+    all_nitrate = np.array(all_nitrate_trajectories)
+    all_prod = np.array(all_production_trajectories)
+    agg_data = {
+        "nitrate_min": np.min(all_nitrate, axis=0),
+        "nitrate_max": np.max(all_nitrate, axis=0),
+        "production_avg": np.mean(all_prod, axis=0)
+    }
+    
+    logger.log_evaluation_trajectory(agent_name, best_states, best_actions, best_rewards, best_infos, agg_data)
     print(f"Best Episode Plotted Reward: {best_ep_reward:.2f}")
-    Plotter.plot_evaluation_trajectories(logger.eval_data, agent_name=agent_name)
 
 # =============================================================================
 # SCRIPT EXECUTION
 # =============================================================================
 if __name__ == "__main__":
     logger = DataLogger()
-    lag_agent = NonResNet_Agent(STATE_DIM, ACTION_DIM, LR_ACTOR, LR_CRITIC, GAMMA, K_EPOCHS, EPS_CLIP)
+    lag_agent = NonResNet_Agent(STATE_DIM, ACTION_DIM, LR_ACTOR, LR_CRITIC, GAMMA, K_EPOCHS, EPS_CLIP, ENTROPY_COEFF)
     sprl_agent = SPRL_Agent(STATE_DIM, ACTION_DIM, LR_ACTOR, LR_CRITIC, GAMMA, K_EPOCHS, EPS_CLIP, ENTROPY_COEFF)
     
     # Training
@@ -238,5 +254,5 @@ if __name__ == "__main__":
     if not EVALUATE_ONLY:
         Plotter.plot_training_violations(logger)
         
-    # Plot Evaluation Violations
-    Plotter.plot_evaluation_violations(logger, noise_level=NOISE_STD)
+    # Plot Evaluation Trajectories and Violations
+    Plotter.plot_comprehensive_evaluation(logger.eval_data, logger.eval_violations)
