@@ -1,12 +1,27 @@
+"""
+Utility module for metrics tracking and visualization.
+
+This module provides the `DataLogger` for recording episode trajectories,
+rewards, and constraint violations during both training and evaluation phases.
+It also includes the `Plotter` class for generating comparative visualizations
+of agent performance and safety integrity.
+"""
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
 
 class DataLogger:
+    """
+    Centralized logging architecture for recording agent metrics.
+    Maintains separate dictionaries for standard continuous tracking.
+    """
     def __init__(self):
+        # 1. Training metrics
         self.training_log = {"NonResNet": [], "SPRL": []}
         self.training_violations = {"NonResNet": [], "SPRL": []}
+        
+        # 2. Evaluation metrics
         self.eval_data = {"NonResNet": None, "SPRL": None}
         self.eval_violations = {"NonResNet": [], "SPRL": []}
         self.eval_violations_details = {"NonResNet": {"g1": [], "g2": [], "g3": []}, "SPRL": {"g1": [], "g2": [], "g3": []}}
@@ -16,12 +31,15 @@ class DataLogger:
         self.training_violations[agent_name].append(violation_count)
 
     def log_evaluation_trajectory(self, agent_name, states, actions, rewards, info_list):
-        # Updated to handle the flat info dictionary from env.py
+        """
+        Records a full environmental trajectory from the evaluation phase.
+        The flat info dictionary returned by the environment is parsed and stored.
+        """
         self.eval_data[agent_name] = {
             "states": np.array(states),   
             "actions": np.array(actions), 
             "rewards": np.array(rewards), 
-            "is_safe": np.array([1 if i["violation_count"] == 0 else 0 for i in info_list]), # Map violations to safety
+            "is_safe": np.array([1 if i["violation_count"] == 0 else 0 for i in info_list]), # Map physical violations to Boolean safety
             "metrics": pd.DataFrame(info_list) 
         }
         
@@ -32,8 +50,14 @@ class DataLogger:
         self.eval_violations_details[agent_name]["g3"].append(g3_count)
 
 class Plotter:
+    """
+    Static utility class responsible for generating and saving matplotlib visualizations.
+    """
     @staticmethod
     def plot_training_results(training_log, agent_name, window=50):
+        """
+        Generates a moving-average convergence plot of the cumulative training rewards.
+        """
         rewards = training_log.get(agent_name, [])
         if len(rewards) < window: return
 
@@ -42,13 +66,13 @@ class Plotter:
         plt.plot(mv_avg, label=f"{agent_name} (MA {window})", color='tab:blue')
         plt.plot(rewards, alpha=0.15, color='tab:blue')
         
-        # Scale y-axis based on the moving average to ignore extreme raw outliers
+        # The y-axis is dynamically scaled based on the moving average to ignore extreme initial raw outliers
         valid_mv_avg = mv_avg.dropna()
         if len(valid_mv_avg) > 0:
             y_max = valid_mv_avg.max()
-            y_min = -2.0 # Fixed lower bound as requested
+            y_min = -2.0 # A fixed lower bound is explicitly applied to maintain visual context
             y_range = y_max - y_min
-            # Add a 10% buffer on top, keep bottom at -2
+            # A 10% visual buffer is added to the upper bound
             plt.ylim(y_min, y_max + 0.1 * y_range)
             
         plt.title(f"Training Convergence: {agent_name}")
@@ -97,17 +121,22 @@ class Plotter:
 
     @staticmethod
     def plot_evaluation_trajectories(eval_data, agent_name):
+        """
+        Generates a comprehensive 6-panel subplot visualizing the state evolution,
+        action selections (denormalized to physical units), and safety integrity
+        of the agent's best evaluation trajectory.
+        """
         data = eval_data.get(agent_name)
         if data is None: return
 
-        # Constants from env.py
+        # Constants derived from the physical constraints in env.py
         I_MIN, I_MAX = 120.0, 400.0
         FN_MAX = 40.0
 
         fig, axes = plt.subplots(3, 2, figsize=(15, 12), sharex=True)
         time = np.arange(len(data["states"]))
 
-        # --- States: Biomass, Nitrate, Product ---
+        # --- Subplot Generation: States (Biomass, Nitrate, Product) ---
         labels = [r"Biomass ($c_x$)", r"Nitrate ($c_N$)", r"Product ($c_q$)"]
         for i, label in enumerate(labels):
             ax = axes[i//2, i%2]
@@ -115,18 +144,19 @@ class Plotter:
             ax.set_title(f"{label} over Time")
             ax.grid(True, alpha=0.2)
 
-        # --- Actions: Light Intensity (I) ---
+        # --- Subplot Generation: Actions (Light Intensity I) ---
+        # The latent action space [-1, 1] is mapped back to physical domain boundaries
         I_phys = I_MIN + ((data["actions"][:, 0] + 1.0) / 2.0) * (I_MAX - I_MIN)
         axes[1, 1].plot(time, I_phys, label="Light Intensity", color='tab:green')
         axes[1, 1].set_title(r"Light Intensity ($I$) [$\mu mol/m^2/s$]")
         axes[1, 1].axhline(y=I_MAX, color='r', linestyle='--', alpha=0.3)
         
-        # --- Actions: Nitrate Feed (Fn) ---
+        # --- Subplot Generation: Actions (Nitrate Feed Fn) ---
         Fn_phys = ((data["actions"][:, 1] + 1.0) / 2.0) * FN_MAX
         axes[2, 0].plot(time, Fn_phys, label="Nitrate Feed", color='tab:purple')
         axes[2, 0].set_title(r"Nitrate Feed ($F_N$) [$mg/L/h$]")
 
-        # --- Safety Integrity ---
+        # --- Subplot Generation: Safety Integrity ---
         axes[2, 1].step(time, data["is_safe"], where='post', color='tab:red')
         axes[2, 1].set_title("Safety Integrity (1=Safe, 0=Violation)")
         axes[2, 1].set_ylim([-0.1, 1.1])

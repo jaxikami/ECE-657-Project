@@ -9,8 +9,9 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 class ActionProjectionNetwork(nn.Module):
     """
-    The pre-trained Safeguard. 
-    Expects 4D Physical State: [cx, cN, cq, t_norm]
+    The pre-trained Safety Filter (Safeguard) architecture.
+    Loaded identically to the structure defined in `pretrain.py`.
+    Expects 4D Physical State: [Biomass (cx), Nitrate (cN), Product (cq), Time (t_norm)]
     """
     def __init__(self, state_dim=4, action_dim=2, latent_dim=512):
         super(ActionProjectionNetwork, self).__init__()
@@ -29,15 +30,17 @@ class ActionProjectionNetwork(nn.Module):
         self.elu = nn.ELU()
 
     def forward(self, state_phys, nom_act_norm, apply_override=True):
-        # 1. Internal Static Normalization matching Pretrain
+        # 1. Internal Static Normalization (Matches Pretrain)
         state_norm = (state_phys / self.max_vals) * 2.0 - 1.0
         
         x_in = torch.cat([state_norm, nom_act_norm], dim=1)
         x_proj = self.elu(self.input_layer(x_in))
         
+        # 2. Skip Connection (Residual Connection)
         x_res = self.res_block1(x_proj)
         x_combined = self.elu(x_res + x_proj)
-        # 2. Residual Correction
+        
+        # 3. Residual Correction Calculation
         delta = torch.relu(self.final_layer(x_combined))
         u_nn = nom_act_norm - delta
         
@@ -60,20 +63,22 @@ class ActionProjectionNetwork(nn.Module):
         fn_max_term = (N_LIMIT_TERM * 0.95 - cN) / safe_time_remaining
         u_max_term = ((fn_max_term / FN_MAX) * 2.0) - 1.0
         
-        # Ensure we don't violate absolute action space boundaries
+        # Ensure calculated maximum bounded action space is respected [-1, 1]
         u_max_term = torch.clamp(u_max_term, min=-1.0, max=1.0)
         
         u_safe = u_nn.clone()
-        # Cap the neural network's feed action at the maximum allowed safe boundary
-        # This operation is fully differentiable out-of-the-box (gradients route to the chosen min argument),
-        # preserving the mapping penalty pathway for the PPO actor.
+        # Direct intervention: The neural network's feed action is capped at the maximum 
+        # allowed safe boundary to enforce compliance.
+        # This operation is fully differentiable out-of-the-box (gradients route through 
+        # the selected min argument), preserving the mapping penalty pathway for the PPO actor.
         u_safe[:, 1] = torch.where(near_end, torch.minimum(u_nn[:, 1], u_max_term), u_nn[:, 1])
         
         return u_safe
 
 class ActorCritic(nn.Module):
     """
-    Learns the latent intent 'z' based on the 4D state.
+    Standard PPO Actor-Critic neural network architecture generating the raw intent 'z'.
+    The intent 'z' is squashed and evaluated identically to a normal unconstrained agent.
     """
     def __init__(self, state_dim=4, action_dim=2):
         super(ActorCritic, self).__init__()
@@ -94,20 +99,34 @@ class ActorCritic(nn.Module):
         )
 
     def act(self, state):
+        """
+        Generates an intended action (z) during the environment rollout phase.
+        
+        Returns:
+            z: The squashed intended action mapped to [-1, 1].
+            log_prob: The log probability of the intended action.
+            z_raw: The unbounded Gaussian sample.
+        """
         mean = self.actor(state)
         std = torch.exp(torch.clamp(self.log_std, self.LOG_STD_MIN, self.LOG_STD_MAX))
         dist = Normal(mean, std)
         
+        # 1. Sample from unbounded Gaussian first
         z_raw = dist.sample()
+        # 2. Squash to physical bounds [-1, 1]
         z = torch.tanh(z_raw)
         
-        # Tanh Jacobian Correction
+        # 3. Tanh Squashing Correction for LogProb
         log_prob = dist.log_prob(z_raw).sum(dim=-1)
         log_prob -= torch.log(1 - z.pow(2) + 1e-6).sum(dim=-1)
         
         return z.detach(), log_prob.detach(), z_raw.detach()
 
     def evaluate(self, state, z_raw):
+        """
+        Evaluates the probabilities and values of previous intents during the PPO update loop.
+        Requires the UNBOUNDED 'z_raw' parameter to recalculate exact Gaussian probabilities.
+        """
         mean = self.actor(state)
         std = torch.exp(torch.clamp(self.log_std, self.LOG_STD_MIN, self.LOG_STD_MAX))
         dist = Normal(mean, std)
@@ -121,13 +140,16 @@ class ActorCritic(nn.Module):
         return log_probs, state_values, dist_entropy
 
 class SPRL_Agent:
+    """
+    Wrapper class managing the Safe PPO learning algorithms, rollouts, and models.
+    """
     def __init__(self, state_dim, action_dim, lr_actor, lr_critic, gamma, K_epochs, eps_clip, entropy_coeff):
-        self.gamma = gamma               
-        self.eps_clip = eps_clip         
-        self.K_epochs = K_epochs         
+        self.gamma = gamma               # Discount factor for future rewards
+        self.eps_clip = eps_clip         # PPO surrogate objective clipping parameter
+        self.K_epochs = K_epochs         # Number of policy update iterations per rollout batch
         self.entropy_coeff = entropy_coeff 
 
-        # 1. Actor-Critic (Now 4D to include Time)
+        # 1. Actor-Critic Network Initialization
         self.policy = ActorCritic(state_dim=4, action_dim=2).to(device)
         self.optimizer = torch.optim.Adam([
             {'params': self.policy.actor.parameters(), 'lr': lr_actor},
@@ -138,8 +160,9 @@ class SPRL_Agent:
         self.policy_old = ActorCritic(state_dim=4, action_dim=2).to(device)
         self.policy_old.load_state_dict(self.policy.state_dict())
         
-        # 2. Safeguard
-        self.safeguard = ActionProjectionNetwork(state_dim=4, action_dim=2).to(device)
+        # 2. Safeguard (Safety Filter) Network Initialization
+        # Loaded identically and strictly set into evaluation mode to ensure 
+        # the weights remain completely frozen during the RL loop.        self.safeguard = ActionProjectionNetwork(state_dim=4, action_dim=2).to(device)
         if os.path.exists("action_projection_network.pth"):
             self.safeguard.load_state_dict(torch.load("action_projection_network.pth", map_location=device))
             self.safeguard.eval()
@@ -149,28 +172,35 @@ class SPRL_Agent:
 
     def select_action(self, state_norm):
         """
+        Selects an action by generating an intent and passing it through the Safeguard.
+        
         Input: state_norm [cx, cN, cq, t_norm] from environment.
         """
         with torch.no_grad():
             state_t = torch.FloatTensor(state_norm).to(device).unsqueeze(0)
             
-            # 1. Generate Intent 'z'
+            # 1. Generate Intent 'z' based on the standard unconstrained policy
             z, log_prob, z_raw = self.policy_old.act(state_t)
             
-            # 2. Denormalize to Physical Units for Safeguard
-            # [6.0, 800.0, 0.1, 1.0] matches env.py and pretrain.py
+            # 2. Denormalize completely to Physical Units for the Safeguard filter
+            # Extents: [6.0, 800.0, 0.1, 1.0] corresponds with env.py and pretrain.py
             phys_scale = torch.tensor([6.0, 800.0, 0.1, 1.0], device=device)
             state_phys = state_t * phys_scale
             
-            # The safeguard acts as the final differentiable layer of the policy network.
-            # We return u_safe to the environment so the agent is strictly On-Policy (SP-RL).
+            # 3. Action Projection Application
+            # The safeguard acts as the final analytical layer of the policy network.
+            # 'u_safe' is returned to the environment so the agent is strictly On-Policy (SP-RL).
             u_safe = self.safeguard(state_phys, z)
             
-        # Return the Safe Action (u_safe) to be executed by the environment, 
-        # tracking z_raw for mapping penalty backpropagation.
+        # The Safe Action (u_safe) is executed by the environment, 
+        # while z_raw is stored in memory for PPO mapping penalty backpropagation.
         return u_safe.cpu().numpy().flatten(), log_prob.cpu().numpy(), z_raw.cpu().numpy().flatten()
 
     def learn(self, memory):
+        """
+        Executes the Proximal Policy Optimization (PPO) training update, 
+        incorporating the exact SPRL Action Mapping penalty logic.
+        """
         rewards = []
         discounted_reward = 0
         for reward, is_terminal in zip(reversed(memory.rewards), reversed(memory.is_terminals)):
@@ -178,6 +208,7 @@ class SPRL_Agent:
             discounted_reward = reward + (self.gamma * discounted_reward)
             rewards.insert(0, discounted_reward)
 
+        # Standardize baseline rewards to improve gradient stability
         rewards = torch.tensor(rewards, dtype=torch.float32).to(device)
         rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-7)
 
@@ -195,21 +226,24 @@ class SPRL_Agent:
             surr2 = torch.clamp(ratios, 1 - self.eps_clip, 1 + self.eps_clip) * advantages
             ppo_loss = -torch.min(surr1, surr2).mean()
 
-            # 2. SP-RL Mapping Penalty
+            # 2. SP-RL Mapping Penalty Evaluation
+            # Reconstructs the exact intervention the safeguard initially applied
             with torch.no_grad():
                 phys_scale = torch.tensor([6.0, 800.0, 0.1, 1.0], device=device)
                 states_phys = old_states * phys_scale
                 z_intent = torch.tanh(old_z_raw)
                 u_safe = self.safeguard(states_phys, z_intent)
 
-            # Penalty: If safeguard modified the action, punish the actor
+            # Mapping Penalty: If the safeguard modified the action significantly,
+            # this MSE loss sharply punishes the Actor network for issuing the bad intent.
             mapping_penalty = self.mapping_criterion(z_intent, u_safe)
             
-            # 3. Total Loss
+            # 3. Total Custom Loss Aggregation
+            # Minimizes mapping penalty alongside standard PPO objectives
             loss = ppo_loss + \
                    0.5 * self.MseLoss(state_values.squeeze(), rewards) - \
                    self.entropy_coeff * dist_entropy.mean() + \
-                   0.001 * mapping_penalty # Coefficient for safety alignment (reduced from 0.01)
+                   0.001 * mapping_penalty # Alignment coefficient for safety mapping
 
             self.optimizer.zero_grad()
             loss.backward()

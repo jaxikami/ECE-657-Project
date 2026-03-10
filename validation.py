@@ -15,15 +15,19 @@ def run_synchronized_stress_test(num_test_samples=5000):
     safeguard.load_state_dict(torch.load("action_projection_network.pth", map_location=device))
     safeguard.eval()
     
-    # Physical Constants
-    I_MIN, I_MAX = 120.0, 400.0
-    FN_MAX = 40.0
-    N_LIMIT = 800.0
-    RATIO_LIMIT = 0.011
-    TOTAL_TIME = 240.0
-    CONTROL_FREQ = 20.0
-    SIGMA = 0.05  # 5% Gaussian deviation
+    # =========================================================================
+    # 1. Physical Constants & Operational Limits
+    # Derived from the specific bioreactor case study parameters.
+    # =========================================================================
+    I_MIN, I_MAX = 120.0, 400.0   # Light intensity bounds
+    FN_MAX = 40.0                 # Max allowable nitrate feed rate
+    N_LIMIT = 800.0               # Constraint g1: Max allowed nitrate concentration
+    RATIO_LIMIT = 0.011           # Constraint g2 target
+    TOTAL_TIME = 240.0            # Total duration of an episode (hours)
+    CONTROL_FREQ = 20.0           # 20-hour control decision window
+    SIGMA = 0.05                  # 5% Gaussian deviation used for exploring edge cases
 
+    # Helper functions to convert normalized actions [-1, 1] back to physical quantities
     def denorm_fn(val_norm):
         return ((val_norm + 1.0) / 2.0) * FN_MAX
 
@@ -31,10 +35,14 @@ def run_synchronized_stress_test(num_test_samples=5000):
         return I_MIN + ((val_norm + 1.0) / 2.0) * (I_MAX - I_MIN)
 
     def gaussian_sample(mean, std_scale=SIGMA):
-        """Helper to sample around a mean with 0.05 relative deviation."""
+        """Helper to sample states around a specific mean with a given relative deviation."""
         return torch.normal(mean, mean * std_scale, (num_test_samples,), device=device)
 
-    # --- TEST 1: Nitrate Accumulation (20h Window) ---
+    # =========================================================================
+    # --- TEST 1: Nitrate Accumulation (20h Window) Penalty g1 ---
+    # Purpose: Verify the filter securely restricts feed intent so that accumulation 
+    # over the upcoming control window stays under the absolute safety limit limit.
+    # =========================================================================
     print(f"\n--- [TEST 1] g1: 20h Predictive Budget (Target < {N_LIMIT*0.995}) ---")
     t_norm = torch.rand(num_test_samples, device=device)
     t_phys = t_norm * TOTAL_TIME
@@ -62,7 +70,11 @@ def run_synchronized_stress_test(num_test_samples=5000):
             g1_passes += 1
     print(f"Result: {g1_passes}/{num_test_samples} passed (20h state < {target_limit})")
 
+    # =========================================================================
     # --- TEST 2: Terminal Nitrate Constraint (g3) ---
+    # Purpose: Verify the network prevents greedily maximizing feed at the very
+    # end of an episode, guaranteeing the terminal nitrate budget is satisfied.
+    # =========================================================================
     N_LIMIT_TERM = 150.0
     print(f"\n--- [TEST 2] g3: Terminal Nitrate Protection (Target < {N_LIMIT_TERM}) ---")
     
@@ -100,7 +112,11 @@ def run_synchronized_stress_test(num_test_samples=5000):
             
     print(f"Result: {g3_passes}/{num_test_samples} passed (Terminal state projected < {target_limit_term})")
 
+    # =========================================================================
     # --- TEST 3: Identity Mapping (Safe Region) ---
+    # Purpose: Prove that the neural network's architecture (skip connections) 
+    # prevents it from interfering with intents when perfectly safe.
+    # =========================================================================
     print(f"\n--- [TEST 3] Identity Mapping: Stochastic Safe Zone (Diff <= 1%) ---")
     
     # Gaussian sampling for ALL states
