@@ -77,7 +77,7 @@ class ActorCritic(nn.Module):
     """
     def __init__(self, state_dim=4, action_dim=2):
         super(ActorCritic, self).__init__()
-        self.LOG_STD_MIN = -2.0
+        self.LOG_STD_MIN = -1.0
         self.LOG_STD_MAX = 0.5
 
         self.actor = nn.Sequential(
@@ -145,7 +145,7 @@ class SPRL_Agent:
             self.safeguard.eval()
 
         self.MseLoss = nn.MSELoss()
-        self.mapping_criterion = nn.SmoothL1Loss(beta=0.05)
+        self.mapping_criterion = nn.MSELoss()
 
     def select_action(self, state_norm):
         """
@@ -162,14 +162,13 @@ class SPRL_Agent:
             phys_scale = torch.tensor([6.0, 800.0, 0.1, 1.0], device=device)
             state_phys = state_t * phys_scale
             
-            # We compute u_safe to see what the safeguard WOULD do, but we DO NOT return it.
-            # During training, the environment MUST execute what the Actor chose (z) so the Actor 
-            # can learn from environmental penalties (G1/G2). The loss function will separately 
-            # penalize the Actor for differing from the Safeguard.
+            # The safeguard acts as the final differentiable layer of the policy network.
+            # We return u_safe to the environment so the agent is strictly On-Policy (SP-RL).
             u_safe = self.safeguard(state_phys, z)
             
-        # Return the Actor's Intent (z) so the environment executes what the Actor actually wanted!
-        return z.cpu().numpy().flatten(), log_prob.cpu().numpy(), z_raw.cpu().numpy().flatten()
+        # Return the Safe Action (u_safe) to be executed by the environment, 
+        # tracking z_raw for mapping penalty backpropagation.
+        return u_safe.cpu().numpy().flatten(), log_prob.cpu().numpy(), z_raw.cpu().numpy().flatten()
 
     def learn(self, memory):
         rewards = []
@@ -210,7 +209,7 @@ class SPRL_Agent:
             loss = ppo_loss + \
                    0.5 * self.MseLoss(state_values.squeeze(), rewards) - \
                    self.entropy_coeff * dist_entropy.mean() + \
-                   0.01 * mapping_penalty # Coefficient for safety alignment (reduced from 0.1)
+                   0.001 * mapping_penalty # Coefficient for safety alignment (reduced from 0.01)
 
             self.optimizer.zero_grad()
             loss.backward()

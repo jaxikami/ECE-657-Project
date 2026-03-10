@@ -14,14 +14,14 @@ ACTION_DIM = 2
 MAX_EPISODES = 50000 
 UPDATE_TIMESTEP = 1000 # Adjusted for stability 
 K_EPOCHS = 40
-EPS_CLIP = 0.2
+EPS_CLIP = 0.3
 GAMMA = 0.99
 LR_ACTOR = 3e-4
 LR_CRITIC = 1e-3
 MIN_LR = 1e-5 
 ENTROPY_COEFF = 0.05
-EVALUATE_ONLY = True  # Set to False to run the 100k episode training loop
-NOISE_STD = 0.05
+EVALUATE_ONLY = False  # Set to False to run the 100k episode training loop
+NOISE_STD = 0.2
 
 class Memory:
     def __init__(self):

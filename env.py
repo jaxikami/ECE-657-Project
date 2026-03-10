@@ -156,7 +156,7 @@ class PhycocyaninEnv:
         self.prev_action = a_clipped.copy()
         
         # Nitrate usage (encourages metabolism efficiency)
-        n_use_p = 0.005 * Fn_phys
+        n_use_p = 0.007 * Fn_phys
         
         # Production Reward
         prod_r = self.state[2] * 10
