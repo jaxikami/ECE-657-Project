@@ -116,15 +116,21 @@ class PhycocyaninEnv:
         self.g2_violation_count = 0
         self.g3_violation_count = 0
         
-        # Initial State Base: [1.0 g/L, 150 mg/L, 0.0 mg/L]
-        self.state = np.array([1.0, 150.0, 0.0], dtype=np.float64)
+        # Initial State Base: [1.1 g/L, 150 mg/L, 0.01 mg/L]
+        self.state = np.array([1.1, 150.0, 0.01], dtype=np.float64)
         
         # Add Initial State Randomization for Robustness Evaluation
         if randomize:
-            # Vary Biomass between 0.8 and 1.2 g/L
-            self.state[0] = np.random.uniform(0.8, 1.2)
-            # Vary initial Nitrate between 100.0 and 200.0 mg/L
-            self.state[1] = np.random.uniform(100.0, 200.0)
+            # Define how much 'spread' you want as a fraction of each state's value
+            # 0.10 means a standard deviation of 10% of each state variable's base value
+            noise_factor = 0.10
+            
+            # Generate Gaussian noise: Mean = base_state, Std Dev = base_state * noise_factor
+            # This keeps noise proportional across all state variables (Biomass, Nitrate, Phycocyanin)
+            self.state = np.random.normal(loc=self.state, scale=np.abs(self.state) * noise_factor)
+            
+            # Apply noise and ensure values stay non-negative
+            self.state = np.maximum(0.0, self.state)
             
         self.prev_action = np.zeros(2)
         
@@ -171,7 +177,7 @@ class PhycocyaninEnv:
         # During deployment (is_training=False), minor violations are not penalized 
         # as harshly to encourage smooth trajectory execution, relying instead on the 
         # safety filter's absolute bounds.
-        minor_coef = 0 if getattr(self, 'is_training', False) else 2
+        minor_coef = 2 if getattr(self, 'is_training', False) else 0
         severe_coef = 200
         
         # =====================================================================
@@ -183,9 +189,9 @@ class PhycocyaninEnv:
         n_vio_p = 0.0
         n_ratio = self.state[1] / self.N_LIMIT_PATH
         # Reverse log barrier approaching infinity as n_ratio -> 1, centered near 0.95
-        if n_ratio > 0.95 and n_ratio < 1.0:
+        if n_ratio > 0.995 and n_ratio < 1.0:
             # Shift ratio such that evaluating at 0.95 gives roughly log(1.0) = 0
-            n_vio_p -= minor_coef * np.log(1.05 - n_ratio) 
+            n_vio_p -= minor_coef * np.log(1.005 - n_ratio) 
         if n_ratio > 1.0:
             n_vio_p += severe_coef * (n_ratio - 1.0) 
             self.violation_count += 1
@@ -195,8 +201,8 @@ class PhycocyaninEnv:
         q_vio_p = 0.0
         ratio = self.state[2] / (self.state[0] + 1e-8)
         q_ratio = ratio / self.RATIO_LIMIT
-        if q_ratio > 0.95 and q_ratio < 1.0:
-            q_vio_p -= minor_coef * np.log(1.05 - q_ratio)
+        if q_ratio > 0.995 and q_ratio < 1.0:
+            q_vio_p -= minor_coef * np.log(1.005 - q_ratio)
         if ratio > self.RATIO_LIMIT:
             q_vio_p += severe_coef * (q_ratio - 1.0)
             self.violation_count += 1
@@ -234,8 +240,8 @@ class PhycocyaninEnv:
             t_ratio = self.state[1] / self.N_LIMIT_TERM
             t_penalty = 0.0
             
-            if t_ratio > 0.95 and t_ratio < 1.0:
-                t_penalty -= minor_coef * np.log(1.05 - t_ratio) * 100
+            if t_ratio > 0.995 and t_ratio < 1.0:
+                t_penalty -= minor_coef * np.log(1.005 - t_ratio) * 100
                 
             if t_ratio > 1.0:
                 t_penalty += severe_coef * (t_ratio - 1.0) * 100

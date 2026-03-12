@@ -24,7 +24,7 @@ class ActionProjectionNetwork(nn.Module):
         
         # Internal Static Normalization Constants [Biomass (cx), Nitrate (cN), Product (cq), Time (t_norm)]
         # This ensures the network always scales raw state inputs to [-1, 1] internally.
-        self.register_buffer("max_vals", torch.tensor([6.0, 800.0, 0.1, 1.0]))
+        self.register_buffer("max_vals", torch.tensor([6.0, 800.0, 0.2, 1.0]))
         
         # Input layer combines the 4D state space and 2D nominal action 
         self.input_layer = nn.Linear(state_dim + action_dim, latent_dim)

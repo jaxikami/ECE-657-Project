@@ -16,7 +16,7 @@ class ActionProjectionNetwork(nn.Module):
     def __init__(self, state_dim=4, action_dim=2, latent_dim=512):
         super(ActionProjectionNetwork, self).__init__()
         # Synchronized with pretrain.py
-        self.register_buffer("max_vals", torch.tensor([6.0, 800.0, 0.1, 1.0]))
+        self.register_buffer("max_vals", torch.tensor([6.0, 800.0, 0.2, 1.0]))
         
         self.input_layer = nn.Linear(state_dim + action_dim, latent_dim)
         self.res_block1 = nn.Sequential(
@@ -185,7 +185,7 @@ class SPRL_Agent:
             
             # 2. Denormalize completely to Physical Units for the Safeguard filter
             # Extents: [6.0, 800.0, 0.1, 1.0] corresponds with env.py and pretrain.py
-            phys_scale = torch.tensor([6.0, 800.0, 0.1, 1.0], device=device)
+            phys_scale = torch.tensor([6.0, 800.0, 0.2, 1.0], device=device)
             state_phys = state_t * phys_scale
             
             # 3. Action Projection Application
@@ -230,7 +230,7 @@ class SPRL_Agent:
             # 2. SP-RL Mapping Penalty Evaluation
             # Reconstructs the exact intervention the safeguard initially applied
             with torch.no_grad():
-                phys_scale = torch.tensor([6.0, 800.0, 0.1, 1.0], device=device)
+                phys_scale = torch.tensor([6.0, 800.0, 0.2, 1.0], device=device)
                 states_phys = old_states * phys_scale
                 z_intent = torch.tanh(old_z_raw)
                 u_safe = self.safeguard(states_phys, z_intent)

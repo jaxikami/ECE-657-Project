@@ -23,8 +23,8 @@ LR_ACTOR = 3e-4        # Initial learning rate for the Actor network
 LR_CRITIC = 1e-3       # Initial learning rate for the Critic network
 MIN_LR = 1e-5          # Minimum learning rate bound for the linear scheduler
 ENTROPY_COEFF = 0.05   # Exploration coefficient for the SPRL agent
-EVALUATE_ONLY = True  # Set to False to run the full training loop before evaluation
-NOISE_STD = 0.05      # Standard deviation of the Gaussian noise applied to agent intent during evaluation
+EVALUATE_ONLY = False  # Set to False to run the full training loop before evaluation
+NOISE_STD = 0.1      # Standard deviation of the Gaussian noise applied to agent intent during evaluation
 
 class Memory:
     """
@@ -49,6 +49,7 @@ def train_agent(agent_name, agent, logger):
     """
     print(f"\n--- Starting Training: {agent_name} ---")
     env = PhycocyaninEnv()
+    env.is_training = True
     memory = Memory()
     scheduler = LinearLR(agent.optimizer, start_factor=1.0, end_factor=0.01, total_iters=MAX_EPISODES)
     
@@ -127,7 +128,7 @@ def train_agent(agent_name, agent, logger):
     torch.save(agent.policy.state_dict(), f"{agent_name}_final_weights.pth")
     Plotter.plot_training_results(logger.training_log, agent_name=agent_name)
 
-def evaluate_agent(agent_name, agent, logger, eval_episodes=1000, noise_std=0.05):
+def evaluate_agent(agent_name, agent, logger, eval_episodes=10000, noise_std=0.05):
     """
     Evaluates a trained agent's robustness against both initial state variations
     and continuous intent observation noise.
@@ -179,7 +180,7 @@ def evaluate_agent(agent_name, agent, logger, eval_episodes=1000, noise_std=0.05
             with torch.no_grad():
                 if agent_name == "SPRL":
                     noisy_intent_t = torch.FloatTensor(noisy_intent).to(state_t.device).unsqueeze(0)
-                    phys_scale = torch.tensor([6.0, 800.0, 0.1, 1.0], device=state_t.device)
+                    phys_scale = torch.tensor([6.0, 800.0, 0.2, 1.0], device=state_t.device)
                     action = agent.safeguard(state_t * phys_scale, noisy_intent_t).cpu().numpy().flatten()
                 else:
                     action = noisy_intent
