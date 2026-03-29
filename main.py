@@ -4,7 +4,7 @@ import numpy as np
 import os
 from tqdm import tqdm
 from env import PhycocyaninEnv
-from lag_agent import NonResNet_Agent
+from lag_agent import StandardRL_Agent
 from res_net_agent import SPRL_Agent
 from utils import DataLogger, Plotter
 from torch.optim.lr_scheduler import LinearLR
@@ -23,7 +23,7 @@ LR_ACTOR = 3e-4        # Initial learning rate for the Actor network
 LR_CRITIC = 1e-3       # Initial learning rate for the Critic network
 MIN_LR = 1e-5          # Minimum learning rate bound for the linear scheduler
 ENTROPY_COEFF = 0.05   # Exploration coefficient for the SPRL agent
-EVALUATE_ONLY = False  # Set to False to run the full training loop before evaluation
+EVALUATE_ONLY = True  # Set to False to run the full training loop before evaluation
 NOISE_STD = 0.1      # Standard deviation of the Gaussian noise applied to agent intent during evaluation
 
 class Memory:
@@ -152,6 +152,7 @@ def evaluate_agent(agent_name, agent, logger, eval_episodes=10000, noise_std=0.0
     # Aggregated metrics for plotting
     all_nitrate_trajectories = []
     all_production_trajectories = []
+    all_ratio_trajectories = []
     
     for _ in range(eval_episodes):
         # The environment is reset with randomized initial conditions for robust evaluation.
@@ -203,6 +204,7 @@ def evaluate_agent(agent_name, agent, logger, eval_episodes=10000, noise_std=0.0
             
         all_nitrate_trajectories.append([s[1] for s in ep_states])
         all_production_trajectories.append([s[2] for s in ep_states])
+        all_ratio_trajectories.append([(s[2] * 0.2) / (s[0] * 6.0 + 1e-8) for s in ep_states])
         
         # Violation Archiving
         if len(ep_infos) > 0:
@@ -226,10 +228,15 @@ def evaluate_agent(agent_name, agent, logger, eval_episodes=10000, noise_std=0.0
     # Calculate aggregation statistics
     all_nitrate = np.array(all_nitrate_trajectories)
     all_prod = np.array(all_production_trajectories)
+    all_ratio = np.array(all_ratio_trajectories)
     agg_data = {
         "nitrate_min": np.min(all_nitrate, axis=0),
         "nitrate_max": np.max(all_nitrate, axis=0),
-        "production_avg": np.mean(all_prod, axis=0)
+        "production_avg": np.mean(all_prod, axis=0),
+        "ratio_min": np.min(all_ratio, axis=0),
+        "ratio_max": np.max(all_ratio, axis=0),
+        "ratio_avg": np.mean(all_ratio, axis=0),
+        "ratio_std": np.std(all_ratio, axis=0)
     }
     
     logger.log_evaluation_trajectory(agent_name, best_states, best_actions, best_rewards, best_infos, agg_data)
@@ -240,16 +247,16 @@ def evaluate_agent(agent_name, agent, logger, eval_episodes=10000, noise_std=0.0
 # =============================================================================
 if __name__ == "__main__":
     logger = DataLogger()
-    lag_agent = NonResNet_Agent(STATE_DIM, ACTION_DIM, LR_ACTOR, LR_CRITIC, GAMMA, K_EPOCHS, EPS_CLIP, ENTROPY_COEFF)
+    lag_agent = StandardRL_Agent(STATE_DIM, ACTION_DIM, LR_ACTOR, LR_CRITIC, GAMMA, K_EPOCHS, EPS_CLIP, ENTROPY_COEFF)
     sprl_agent = SPRL_Agent(STATE_DIM, ACTION_DIM, LR_ACTOR, LR_CRITIC, GAMMA, K_EPOCHS, EPS_CLIP, ENTROPY_COEFF)
     
     # Training
     if not EVALUATE_ONLY:
-        train_agent("NonResNet", lag_agent, logger)
+        train_agent("Standard RL", lag_agent, logger)
         train_agent("SPRL", sprl_agent, logger)
         
     # Evaluation (with aggressive 20% intent noise)
-    evaluate_agent("NonResNet", lag_agent, logger, noise_std=NOISE_STD)
+    evaluate_agent("Standard RL", lag_agent, logger, noise_std=NOISE_STD)
     evaluate_agent("SPRL", sprl_agent, logger, noise_std=NOISE_STD)
     
     if not EVALUATE_ONLY:

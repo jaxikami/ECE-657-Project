@@ -7,19 +7,19 @@ import numpy as np
 # Hardware setup
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-class ActorCriticNonResNet(nn.Module):
+class ActorCriticStandardRL(nn.Module):
     """
     Standard PPO Actor-Critic neural network architecture.
     
     This agent learns mapping from states to actions directly. It is considered
-    'NonResNet' compared to the constrained 'ResNetAgent' because it lacks the
+    a Standard RL agent compared to the constrained SPRL agent because it lacks the
     built-in action projection (skip-connection safety filter) manifold.
     
     It outputs a probability distribution over the action space, allowing the 
     agent to explore the environment safely.
     """
     def __init__(self, state_dim=4, action_dim=2):
-        super(ActorCriticNonResNet, self).__init__()
+        super(ActorCriticStandardRL, self).__init__()
         self.LOG_STD_MIN = -1.0
         self.LOG_STD_MAX = 0.5
 
@@ -88,7 +88,7 @@ class ActorCriticNonResNet(nn.Module):
         state_values = self.critic(state)
         return log_probs, state_values, dist_entropy
 
-class NonResNet_Agent:
+class StandardRL_Agent:
     """
     Wrapper class managing the PPO learning algorithms, memory, and model updates.
     """
@@ -99,14 +99,14 @@ class NonResNet_Agent:
         self.entropy_coeff = entropy_coeff
         
         # 1. Actor-Critic (Now 4D to include Time)
-        self.policy = ActorCriticNonResNet(state_dim=4, action_dim=2).to(device)
+        self.policy = ActorCriticStandardRL(state_dim=4, action_dim=2).to(device)
         self.optimizer = torch.optim.Adam([
             {'params': self.policy.actor.parameters(), 'lr': lr_actor},
             {'params': [self.policy.log_std], 'lr': lr_actor},
             {'params': self.policy.critic.parameters(), 'lr': lr_critic}
         ])
 
-        self.policy_old = ActorCriticNonResNet(state_dim=4, action_dim=2).to(device)
+        self.policy_old = ActorCriticStandardRL(state_dim=4, action_dim=2).to(device)
         self.policy_old.load_state_dict(self.policy.state_dict())
         
         self.MseLoss = nn.MSELoss()
