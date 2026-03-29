@@ -1,58 +1,46 @@
-# project
-# Safe Projection Reinforcement Learning (SPRL) for Photo-Production
+# Safe Policy Reinforcement Learning (SPRL) for Bioreactor Control
 
-This repository implements a **Safe Projection Reinforcement Learning (SPRL)** framework designed to maximize biomass production in a bioreactor while strictly adhering to physical safety constraints. The system utilizes a **Residual Safeguard** to project risky agent "intents" onto a mathematically safe action manifold.
-
----
-
-## 🏗️ Project Architecture
-
-The core of this project is the comparison between a standard PPO agent and an SPRL-enabled agent:
-
-* **NonResNet (Baseline)**: A standard Actor-Critic PPO agent that learns safety constraints indirectly through environment penalties.
-* **SPRL (Proposed)**: An agent that learns a latent intent $z$, which is then passed through a pre-trained **ActionProjectionNetwork** to ensure the final physical action is safe.
-
-
-
-### The Residual Safeguard Logic
-The safeguard does not predict actions directly. Instead, it predicts a **reduction** ($\Delta$) to be subtracted from the agent's intent:
-$$u_{safe} = z_{intent} - \text{ReLU}(\text{network}(s, z_{intent}))$$
-This ensures the safeguard can only decrease production-related actions (throttling) to maintain safety, never increase them beyond the agent's intent.
+This repository implements a **Safe Reinforcement Learning** framework for optimizing Phycocyanin production in a photobioreactor. The project compares a standard Lagrangian PPO approach with **SPRL (Safe Policy Reinforcement Learning)**, which utilizes a pre-trained **Action Projection Network** (Safety Filter) to ensure physical constraints are never violated during the learning process.
 
 ---
 
-## 📂 File Registry
+## 🚀 Overview
 
-| File | Primary Function |
+The bioreactor system is defined by non-linear kinetics (modeled in `env.py`) involving:
+* **States:** Biomass ($c_x$), Nitrate ($c_N$), Phycocyanin ($c_q$), and Normalized Time.
+* **Actions:** Light Intensity ($I$) and Nitrate Feed Rate ($F_N$).
+* **Goal:** Maximize $c_q$ production while respecting safety boundaries.
+
+### Safety Constraints
+* **$g_1$ (Path):** Nitrate concentration must stay below **800 mg/L**.
+* **$g_2$ (Ratio):** Maintains a specific bioproduct-to-biomass ratio.
+* **$g_3$ (Terminal):** Nitrate levels must be below **150 mg/L** at the end of the 240-hour batch.
+
+---
+
+## 🏗️ Architecture
+
+### Safe Policy Reinforcement Learning (SPRL)
+The SPRL agent (`res_net_agent.py`) consists of two primary components:
+1.  **Actor-Critic (PPO):** Generates a nominal control "intent."
+2.  **Safety Filter:** A pre-trained Residual Network that intercepts the intent and projects it onto a safe manifold if a violation is predicted. It also includes analytical overrides for terminal safety.
+
+### Standard RL (Baseline)
+The baseline agent (`lag_agent.py`) uses a standard reward-shaping approach, where safety is encouraged via negative penalties (Lagrangian signals) rather than hard architectural constraints.
+
+---
+
+## 📂 Project Structure
+
+| File | Function |
 | :--- | :--- |
-| `pretrain.py` | Trains the `ActionProjectionNetwork` using an **Asymmetric Loss** (20x penalty for safety violations). |
-| `res_net_agent.py` | Implements the **SPRL_Agent** with budget-aware projection and mapping penalties. |
-| `data_gen.py` | Generates biased datasets ($450,000$ samples) focusing on "boundary conditions" near physical limits. |
-| `main.py` | Orchestrates the $50,000$ episode training loop and subsequent evaluation. |
-| `mismatch.py` | Stress-tests the safeguard against edge-case Light and Nitrogen violations. |
-| `lag_agent.py` | Provides the baseline PPO `NonResNet_Agent`. |
-| `utils.py` | Handles logging and generates trajectory/convergence plots. |
+| `main.py` | Primary execution script for training and evaluation loops. |
+| `env.py` | Bioreactor environment using Numba-accelerated ODE integration. |
+| `pretrain.py` | Scripts for training the Safeguard/Safety Filter manifold. |
+| `res_net_agent.py` | Implementation of the SPRL agent with the integrated filter. |
+| `lag_agent.py` | Baseline PPO agent using reward-based penalties. |
+| `data_gen.py` | Synthetic data generation for safety filter pre-training. |
+| `validation.py` | Stress-tests for verifying safeguard identity mapping and safety. |
+| `utils.py` | Data logging and research-quality visualization tools. |
 
 ---
-
-## ⚙️ Physical Constraints & State Space
-
-The environment is governed by two critical physical limits:
-1.  **Light Constraint**: Prevents photo-inhibition. $I_{safe} \leq \frac{I_{CRIT}}{\text{shading} + 1e-6} \cdot 0.95$.
-2.  **Nitrogen Budget**: Prevents nitrate exhaustion. $F_{N} \leq (N_{LIMIT} \cdot 0.95) - c_N$.
-
-### Budget-Aware Features
-To improve safety, the safeguard uses a **4D state space**:
-* $c_x$: Biomass concentration.
-* $c_N$: Nitrate concentration.
-* $c_q$: Product concentration.
-* **Nitrogen Budget Distance**: A normalized feature representing how close the current nitrate level is to the safety "wall".
-
----
-
-## 🚀 Execution Guide
-
-### 1. Manifold Training
-Train the safety safeguard first. The training will automatically exit once the `SmoothL1Loss` converges below $3.0 \times 10^{-4}$.
-```bash
-python pretrain.py
